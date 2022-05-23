@@ -2,6 +2,7 @@
 #include <mma.h> 
 #include <stdio.h>
 using namespace nvcuda::wmma;
+//#define USE_CUBLAS
 static constexpr size_t mBlockWarps = 2;
 static constexpr size_t nBlockWarps = 8;
 static constexpr size_t kBlockWarps = 2;
@@ -143,8 +144,11 @@ int main() {
 	cudaDeviceSynchronize();
 	cudaEventRecord(__begin);
 	cudaEventQuery(__begin);
+#ifdef USE_CUBLAS
 	cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, 8192, 8192, 8192, &alpha, dA, CUDA_R_16F, 8192, dB, CUDA_R_16F, 8192, &beta, dC, CUDA_R_32F, 8192, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-	//gemm << <dim3(nBlocks, mBlocks), (mBlockWarps * nBlockWarps)* WarpSize >> > (dA, dB, dC);
+#else
+	gemm << <dim3(nBlocks, mBlocks), (mBlockWarps * nBlockWarps)* WarpSize >> > (dA, dB, dC);
+#endif
 	_CUassert(cudaDeviceSynchronize());
 	cudaEventRecord(__end);
 	cudaEventSynchronize(__end);
