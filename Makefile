@@ -1,6 +1,6 @@
 default:
 	-rm -rf a.out
-	nvcc -O2 -arch=sm_80 -lcublas -I ../../cutlass/cutlass/include main.cu -keep
+	nvcc -O2 -arch=sm_80 -lcublas -I ../../cutlass/cutlass/include main.cu
 	./a.out
 unit_test:
 	-rm -rf a.out

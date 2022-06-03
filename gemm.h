@@ -4,7 +4,7 @@
 #include <mma.h>
 #include <cublas.h>
 #define private public
-#include "../../cutlass/cutlass/include/cutlass/gemm/device/gemm.h"
+#include <cutlass/gemm/device/gemm.h>
 #undef private
 #include "ptx_gemm.h"
 using namespace nvcuda::wmma;

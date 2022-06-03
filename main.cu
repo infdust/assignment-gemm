@@ -36,6 +36,7 @@ public:
         }
         float time = 0.0f;
         cudaEventElapsedTime(&time, __begin, __end);
+        printf("%g\n", time);
         return time / 1000.0;
     }
     ~GPUTimer()
@@ -54,6 +55,6 @@ using gemmtest = PerfTest<MatMul<MN, K, MN>, GPUTimer>;
 #endif
 int main()
 {
-    gemmtest<MACRO_MN, MACRO_K>().run<1000, 10000>(0);//.run<100, 1000>(1).run<100, 1000>(2);
+    gemmtest<MACRO_MN, MACRO_K>().run<100, 1000>(0).run<100, 1000>(1).run<100, 1000>(2);
     return 0;
 }
