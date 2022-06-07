@@ -3,15 +3,23 @@
 #include <type_traits>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-template <size_t M, size_t K, size_t N>
-struct MMA_GEMM
+template <size_t M, size_t K, size_t N, size_t mode
+          /* mode:
+           * 0 max_perf
+           * 1 conflict_ldgsts
+           * 2 conflict_ldmatrix
+           * 3 no_padding
+           */
+          >
+struct PTX_GEMM
 {
     static constexpr size_t mBlockWarps = 4;
-    static constexpr size_t nBlockWarps = 4;
+    static constexpr size_t nBlockWarps = 2;
     static constexpr size_t kBlockWarps = 1;
     static constexpr size_t mWarpCores = 4;
     static constexpr size_t nWarpCores = 8;
-    static constexpr size_t kWarpCores = 4;
+
+    static constexpr size_t kWarpCores = 4; //
     static constexpr size_t mCoreWidth = 16;
     static constexpr size_t nCoreWidth = 8;
     static constexpr size_t kCoreWidth = 16;
@@ -30,9 +38,10 @@ struct MMA_GEMM
     static constexpr size_t ldA = sizeof(half) * K;
     static constexpr size_t ldB = sizeof(half) * N;
     static constexpr size_t ldC = sizeof(float) * N;
-    static constexpr size_t sldA = sizeof(half) * (kBlockWidth + 8);
-    static constexpr size_t sldB = sizeof(half) * (nBlockWidth + 16);
-    static constexpr size_t sldC = sizeof(float) * (nBlockWidth + 8);
+    static constexpr size_t __padding = (mode<2)?8:((mode==2)?16:0);
+    static constexpr size_t sldA = sizeof(half) * (kBlockWidth + __padding);
+    static constexpr size_t sldB = sizeof(half) * (nBlockWidth + __padding);
+    static constexpr size_t sldC = sizeof(float) * (nBlockWidth + __padding);
     using copy_t = int4;
     static constexpr size_t WarpSize = 32;
     template <typename T, size_t _m, size_t _n, size_t _ld>
@@ -90,11 +99,11 @@ struct MMA_GEMM
                 u_int32_t reg;
             };
         };
-        __device__ Piece get0() const { return {(*this)[(threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4)], (*this)[(threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4) + 1]}; }
-        __device__ Piece get1() const { return {(*this)[8 + (threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4)], (*this)[8 + (threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4) + 1]}; }
-        __device__ Piece get2() const { return {(*this)[(threadIdx.x % WarpSize) / 4][8 + 2 * ((threadIdx.x % WarpSize) % 4)], (*this)[(threadIdx.x % WarpSize) / 4][8 + 2 * ((threadIdx.x % WarpSize) % 4) + 1]}; }
-        __device__ Piece get3() const { return {(*this)[8 + (threadIdx.x % WarpSize) / 4][8 + 2 * ((threadIdx.x % WarpSize) % 4)], (*this)[8 + (threadIdx.x % WarpSize) / 4][8 + 2 * ((threadIdx.x % WarpSize) % 4) + 1]}; }
-        __device__ const void *getRow() const { return &((*this)[(threadIdx.x % WarpSize) % 16][8 * ((threadIdx.x % WarpSize) / 16)]); }
+        __device__ Piece get0() const { return {(*this)[(threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4)], (*this)[(threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4) + 1]}; }
+        __device__ Piece get1() const { return {(*this)[8 + (threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4)], (*this)[8 + (threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4) + 1]}; }
+        __device__ Piece get2() const { return {(*this)[(threadIdx.x % warpSize) / 4][8 + 2 * ((threadIdx.x % warpSize) % 4)], (*this)[(threadIdx.x % warpSize) / 4][8 + 2 * ((threadIdx.x % warpSize) % 4) + 1]}; }
+        __device__ Piece get3() const { return {(*this)[8 + (threadIdx.x % warpSize) / 4][8 + 2 * ((threadIdx.x % warpSize) % 4)], (*this)[8 + (threadIdx.x % warpSize) / 4][8 + 2 * ((threadIdx.x % warpSize) % 4) + 1]}; }
+        __device__ const void *getRow() const { return &((*this)[(threadIdx.x % warpSize) % 16][8 * ((threadIdx.x % warpSize) / 16)]); }
     };
     struct MMA_B : public Matrix<half, 16, 8, sldB>
     {
@@ -113,9 +122,9 @@ struct MMA_GEMM
                 u_int32_t reg;
             };
         };
-        __device__ Piece get0() const { return {(*this)[2 * ((threadIdx.x % WarpSize) % 4)][(threadIdx.x % WarpSize) / 4], (*this)[2 * ((threadIdx.x % WarpSize) % 4) + 1][(threadIdx.x % WarpSize) / 4]}; }
-        __device__ Piece get1() const { return {(*this)[8 + 2 * ((threadIdx.x % WarpSize) % 4)][(threadIdx.x % WarpSize) / 4], (*this)[8 + 2 * ((threadIdx.x % WarpSize) % 4) + 1][(threadIdx.x % WarpSize) / 4]}; }
-        __device__ const void *getRow() const { return &((*this)[(threadIdx.x % WarpSize) % 16][0]); }
+        __device__ Piece get0() const { return {(*this)[2 * ((threadIdx.x % warpSize) % 4)][(threadIdx.x % warpSize) / 4], (*this)[2 * ((threadIdx.x % warpSize) % 4) + 1][(threadIdx.x % warpSize) / 4]}; }
+        __device__ Piece get1() const { return {(*this)[8 + 2 * ((threadIdx.x % warpSize) % 4)][(threadIdx.x % warpSize) / 4], (*this)[8 + 2 * ((threadIdx.x % warpSize) % 4) + 1][(threadIdx.x % warpSize) / 4]}; }
+        __device__ const void *getRow() const { return &((*this)[(threadIdx.x % warpSize) % 16][0]); }
     };
     struct MMA_B2 : public Matrix<half, 16, 16, sldB>
     {
@@ -134,11 +143,11 @@ struct MMA_GEMM
                 u_int32_t reg;
             };
         };
-        __device__ Piece get0() const { return {(*this)[2 * ((threadIdx.x % WarpSize) % 4)][(threadIdx.x % WarpSize) / 4], (*this)[2 * ((threadIdx.x % WarpSize) % 4) + 1][(threadIdx.x % WarpSize) / 4]}; }
-        __device__ Piece get1() const { return {(*this)[8 + 2 * ((threadIdx.x % WarpSize) % 4)][(threadIdx.x % WarpSize) / 4], (*this)[8 + 2 * ((threadIdx.x % WarpSize) % 4) + 1][(threadIdx.x % WarpSize) / 4]}; }
-        __device__ Piece get0_() const { return {(*this)[2 * ((threadIdx.x % WarpSize) % 4)][8 + (threadIdx.x % WarpSize) / 4], (*this)[2 * ((threadIdx.x % WarpSize) % 4) + 1][8 + (threadIdx.x % WarpSize) / 4]}; }
-        __device__ Piece get1_() const { return {(*this)[8 + 2 * ((threadIdx.x % WarpSize) % 4)][8 + (threadIdx.x % WarpSize) / 4], (*this)[8 + 2 * ((threadIdx.x % WarpSize) % 4) + 1][8 + (threadIdx.x % WarpSize) / 4]}; }
-        __device__ const void *getRow() const { return &((*this)[(threadIdx.x % WarpSize) % 16][8 * ((threadIdx.x % WarpSize) / 16)]); }
+        __device__ Piece get0() const { return {(*this)[2 * ((threadIdx.x % warpSize) % 4)][(threadIdx.x % warpSize) / 4], (*this)[2 * ((threadIdx.x % warpSize) % 4) + 1][(threadIdx.x % warpSize) / 4]}; }
+        __device__ Piece get1() const { return {(*this)[8 + 2 * ((threadIdx.x % warpSize) % 4)][(threadIdx.x % warpSize) / 4], (*this)[8 + 2 * ((threadIdx.x % warpSize) % 4) + 1][(threadIdx.x % warpSize) / 4]}; }
+        __device__ Piece get0_() const { return {(*this)[2 * ((threadIdx.x % warpSize) % 4)][8 + (threadIdx.x % warpSize) / 4], (*this)[2 * ((threadIdx.x % warpSize) % 4) + 1][8 + (threadIdx.x % warpSize) / 4]}; }
+        __device__ Piece get1_() const { return {(*this)[8 + 2 * ((threadIdx.x % warpSize) % 4)][8 + (threadIdx.x % warpSize) / 4], (*this)[8 + 2 * ((threadIdx.x % warpSize) % 4) + 1][8 + (threadIdx.x % warpSize) / 4]}; }
+        __device__ const void *getRow() const { return &((*this)[(threadIdx.x % warpSize) % 16][8 * ((threadIdx.x % warpSize) / 16)]); }
     };
     struct MMA_C : public Matrix<float, 16, 8, sldC>
     {
@@ -152,10 +161,10 @@ struct MMA_GEMM
                 u_int32_t reg;
             };
         };
-        __device__ Piece &ref0() { return *(Piece *)&(*this)[(threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4)]; }
-        __device__ Piece &ref1() { return *(Piece *)&(*this)[(threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4) + 1]; }
-        __device__ Piece &ref2() { return *(Piece *)&(*this)[8 + (threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4)]; }
-        __device__ Piece &ref3() { return *(Piece *)&(*this)[8 + (threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4) + 1]; }
+        __device__ Piece &ref0() { return *(Piece *)&(*this)[(threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4)]; }
+        __device__ Piece &ref1() { return *(Piece *)&(*this)[(threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4) + 1]; }
+        __device__ Piece &ref2() { return *(Piece *)&(*this)[8 + (threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4)]; }
+        __device__ Piece &ref3() { return *(Piece *)&(*this)[8 + (threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4) + 1]; }
     };
     struct MMA_C_Global : public Matrix<float, 16, 8, ldC>
     {
@@ -169,10 +178,10 @@ struct MMA_GEMM
                 u_int32_t reg;
             };
         };
-        __device__ Piece &ref0() { return *(Piece *)&(*this)[(threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4)]; }
-        __device__ Piece &ref1() { return *(Piece *)&(*this)[(threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4) + 1]; }
-        __device__ Piece &ref2() { return *(Piece *)&(*this)[8 + (threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4)]; }
-        __device__ Piece &ref3() { return *(Piece *)&(*this)[8 + (threadIdx.x % WarpSize) / 4][2 * ((threadIdx.x % WarpSize) % 4) + 1]; }
+        __device__ Piece &ref0() { return *(Piece *)&(*this)[(threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4)]; }
+        __device__ Piece &ref1() { return *(Piece *)&(*this)[(threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4) + 1]; }
+        __device__ Piece &ref2() { return *(Piece *)&(*this)[8 + (threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4)]; }
+        __device__ Piece &ref3() { return *(Piece *)&(*this)[8 + (threadIdx.x % warpSize) / 4][2 * ((threadIdx.x % warpSize) % 4) + 1]; }
     };
     __device__ static void MMA(typename MMA_A::Piece A0, typename MMA_A::Piece A1, typename MMA_A::Piece A2, typename MMA_A::Piece A3,
                                typename MMA_B::Piece B0, typename MMA_B::Piece B1,
@@ -185,39 +194,52 @@ struct MMA_GEMM
               "r"(B0.reg), "r"(B1.reg),
               "r"(C0.reg), "r"(C1.reg), "r"(C2.reg), "r"(C3.reg));
     }
-    __device__ static void __copyt_global2smem_async(copy_t &dst, const copy_t &src)
-    {
-        asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-            :
-            : "r"((__uint32_t)__cvta_generic_to_shared(&dst)), "l"(&src));
-    }
     template <size_t m, size_t n, size_t ld1, size_t ld2>
-    __device__ static void __global2smem_async(Matrix<copy_t, m, n, ld1> &dst, const Matrix<copy_t, m, n, ld2> &src)
+    __device__ static void __global2smem_async(Matrix<copy_t, m, n, ld1> &dst, const Matrix<copy_t, m, n, ld2> &src, size_t i)
     {
-#pragma unroll
-        for (size_t i = 0; i < m * n / blockWarps; ++i)
-        {
-            auto &_dst = dst.sliceM<blockWarps / n>(i);
-            const auto &_src = src.sliceM<blockWarps / n>(i);
-            __copyt_global2smem_async(_dst[threadIdx.x / n][threadIdx.x % n], _src[threadIdx.x / n][threadIdx.x % n]);
-        }
+        if (mode < 2)
+            asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 16;\n"
+                         :
+                         : "r"((__uint32_t)__cvta_generic_to_shared(&dst[(threadIdx.x / n) * (m * n / blockWarps) + i][threadIdx.x % n])), "l"(&src[(threadIdx.x / n) * (m * n / blockWarps) + i][threadIdx.x % n]));
+        else
+            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
+                         :
+                         : "r"((__uint32_t)__cvta_generic_to_shared(&dst[(threadIdx.x / n) * (m * n / blockWarps) + i][threadIdx.x % n])), "l"(&src[(threadIdx.x / n) * (m * n / blockWarps) + i][threadIdx.x % n]));
+    }
+    __device__ static void __async_commit()
+    {
+        asm volatile("cp.async.commit_group;\n");
     }
     __device__ static void __async_wait()
     {
-        asm volatile("cp.async.wait_all;\n");
+        asm volatile("cp.async.wait_group %0;\n"::"n"(0));
         __syncthreads();
     }
     __device__ static void __ldmatrixA(const MMA_A &A, typename MMA_A::Piece &A0, typename MMA_A::Piece &A1, typename MMA_A::Piece &A2, typename MMA_A::Piece &A3)
     {
+        /*
+        A0=A.get0();
+        A1=A.get1();
+        A2=A.get2();
+        A3=A.get3();
+        return;
+        */
         asm volatile("    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-            : "=r"(A0.reg), "=r"(A1.reg), "=r"(A2.reg), "=r"(A3.reg)
-            : "r"((__uint32_t)__cvta_generic_to_shared(A.getRow())));
+                     : "=r"(A0.reg), "=r"(A1.reg), "=r"(A2.reg), "=r"(A3.reg)
+                     : "r"((__uint32_t)__cvta_generic_to_shared(A.getRow())));
     }
     __device__ static void __ldmatrixB2(const MMA_B2 &B, typename MMA_B::Piece &B0, typename MMA_B::Piece &B1, typename MMA_B::Piece &B0_, typename MMA_B::Piece &B1_)
     {
+        /*
+        B0.reg=B.get0().reg;
+        B1.reg=B.get1().reg;
+        B0_.reg=B.get0_().reg;
+        B1_.reg=B.get1_().reg;
+        return;
+        */
         asm volatile("    ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-            : "=r"(B0.reg), "=r"(B1.reg), "=r"(B0_.reg), "=r"(B1_.reg)
-            : "r"((__uint32_t)__cvta_generic_to_shared(B.getRow())));
+                     : "=r"(B0.reg), "=r"(B1.reg), "=r"(B0_.reg), "=r"(B1_.reg)
+                     : "r"((__uint32_t)__cvta_generic_to_shared(B.getRow())));
     }
     using WarpMatrix_A = Matrix<half, mWarpWidth, kWarpWidth, sldA>;
     using WarpMatrix_B = Matrix<half, kWarpWidth, nWarpWidth, sldB>;
@@ -280,309 +302,578 @@ struct MMA_GEMM
         WarpMatrix_C &warpmemC = _warpmemC.sliceN<nWarpWidth>(nWarpIndex);
         struct MMA_REG
         {
-            typename MMA_A::Piece A0[mWarpCores];
-            typename MMA_A::Piece A1[mWarpCores];
-            typename MMA_A::Piece A2[mWarpCores];
-            typename MMA_A::Piece A3[mWarpCores];
-            typename MMA_B::Piece B0[nWarpCores];
-            typename MMA_B::Piece B1[nWarpCores];
+            typename MMA_A::Piece A[4][mWarpCores];
+            typename MMA_B::Piece B[2][nWarpCores];
         };
-        typename MMA_C::Piece C0[mWarpCores][nWarpCores];
-        typename MMA_C::Piece C1[mWarpCores][nWarpCores];
-        typename MMA_C::Piece C2[mWarpCores][nWarpCores];
-        typename MMA_C::Piece C3[mWarpCores][nWarpCores];
+        typename MMA_C::Piece C[4][mWarpCores][nWarpCores];
         MMA_REG mmaReg[2];
         for (size_t i = 0; i < mWarpCores; ++i)
             for (size_t j = 0; j < nWarpCores; ++j)
             {
-                C0[i][j].reg = 0;
-                C1[i][j].reg = 0;
-                C2[i][j].reg = 0;
-                C3[i][j].reg = 0;
+                C[0][i][j].reg = 0;
+                C[1][i][j].reg = 0;
+                C[2][i][j].reg = 0;
+                C[3][i][j].reg = 0;
             }
         for (size_t i = 0; i < 2; ++i)
             for (size_t j = 0; j < mWarpCores; ++j)
             {
-                mmaReg[i].A0[j].reg = 0;
-                mmaReg[i].A1[j].reg = 0;
-                mmaReg[i].A2[j].reg = 0;
-                mmaReg[i].A3[j].reg = 0;
+                mmaReg[i].A[0][j].reg = 0;
+                mmaReg[i].A[1][j].reg = 0;
+                mmaReg[i].A[2][j].reg = 0;
+                mmaReg[i].A[3][j].reg = 0;
             }
         for (size_t i = 0; i < 2; ++i)
             for (size_t j = 0; j < nWarpCores; ++j)
             {
-                mmaReg[i].B0[j].reg = 0;
-                mmaReg[i].B1[j].reg = 0;
+                mmaReg[i].B[0][j].reg = 0;
+                mmaReg[i].B[1][j].reg = 0;
             }
         {
             const tBlockMatrix_A &tBlockA = blockA.sliceN<kBlockWidth>(0);
-            __global2smem_async(smemA0, tBlockA.copyT());
             const tBlockMatrix_B &tBlockB = blockB.sliceM<kBlockWidth>(0);
-            __global2smem_async(smemB0, tBlockB.copyT());
+            for (size_t i = 0; i < 8; ++i)
+                __global2smem_async(smemA0, tBlockA.copyT(), i);
+            for (size_t i = 0; i < 4; ++i)
+                __global2smem_async(smemB0, tBlockB.copyT(), i);
+                __async_commit();
             __async_wait();
         }
-        for (size_t k = 1; k < kBlocks - 1; k += 2)
+        {
+            const tBlockMatrix_A &tBlockA = blockA.sliceN<kBlockWidth>(1);
+            const tBlockMatrix_B &tBlockB = blockB.sliceM<kBlockWidth>(1);
+            __global2smem_async(smemA1, tBlockA.copyT(), 0);
+            __global2smem_async(smemA1, tBlockA.copyT(), 1);
+            __global2smem_async(smemA1, tBlockA.copyT(), 2);
+            __global2smem_async(smemA1, tBlockA.copyT(), 3);
+            {
+                const auto &_A = warpmemA0.sliceN<kCoreWidth>(0);
+                const auto &_B = warpmemB0.sliceM<kCoreWidth>(0);
+                for (size_t i = 0; i < 4; ++i)
+                {
+                    __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                mmaReg[1].A[0][i],
+                                mmaReg[1].A[1][i],
+                                mmaReg[1].A[2][i],
+                                mmaReg[1].A[3][i]);
+                    __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                 mmaReg[1].B[0][i * 2],
+                                 mmaReg[1].B[1][i * 2],
+                                 mmaReg[1].B[0][i * 2 + 1],
+                                 mmaReg[1].B[1][i * 2 + 1]);
+                }
+            }
+            __global2smem_async(smemA1, tBlockA.copyT(), 4);
+            __global2smem_async(smemA1, tBlockA.copyT(), 5);
+            __global2smem_async(smemA1, tBlockA.copyT(), 6);
+            __global2smem_async(smemA1, tBlockA.copyT(), 7);
+            {
+                const auto &_A = warpmemA0.sliceN<kCoreWidth>(1);
+                const auto &_B = warpmemB0.sliceM<kCoreWidth>(1);
+                for (size_t i = 0; i < 4; ++i)
+                {
+                    for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                        MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                            mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                mmaReg[0].A[0][i],
+                                mmaReg[0].A[1][i],
+                                mmaReg[0].A[2][i],
+                                mmaReg[0].A[3][i]);
+                    for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                        MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                            mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                 mmaReg[0].B[0][i * 2],
+                                 mmaReg[0].B[1][i * 2],
+                                 mmaReg[0].B[0][i * 2 + 1],
+                                 mmaReg[0].B[1][i * 2 + 1]);
+                }
+            }
+            __global2smem_async(smemB1, tBlockB.copyT(), 0);
+            __global2smem_async(smemB1, tBlockB.copyT(), 1);
+            __global2smem_async(smemB1, tBlockB.copyT(), 2);
+            __global2smem_async(smemB1, tBlockB.copyT(), 3);
+            __async_commit();
+            {
+                const auto &_A = warpmemA0.sliceN<kCoreWidth>(2);
+                const auto &_B = warpmemB0.sliceM<kCoreWidth>(2);
+                for (size_t i = 0; i < 4; ++i)
+                {
+                    for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                        MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                            mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                mmaReg[1].A[0][i],
+                                mmaReg[1].A[1][i],
+                                mmaReg[1].A[2][i],
+                                mmaReg[1].A[3][i]);
+                    for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                        MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                            mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                 mmaReg[1].B[0][i * 2],
+                                 mmaReg[1].B[1][i * 2],
+                                 mmaReg[1].B[0][i * 2 + 1],
+                                 mmaReg[1].B[1][i * 2 + 1]);
+                }
+            }
+            {
+                const auto &_A = warpmemA0.sliceN<kCoreWidth>(3);
+                const auto &_B = warpmemB0.sliceM<kCoreWidth>(3);
+                for (size_t i = 0; i < 4; ++i)
+                {
+                    for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                        MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                            mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                mmaReg[0].A[0][i],
+                                mmaReg[0].A[1][i],
+                                mmaReg[0].A[2][i],
+                                mmaReg[0].A[3][i]);
+                    for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                        MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                            mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                 mmaReg[0].B[0][i * 2],
+                                 mmaReg[0].B[1][i * 2],
+                                 mmaReg[0].B[0][i * 2 + 1],
+                                 mmaReg[0].B[1][i * 2 + 1]);
+                }
+            }
+            __async_wait();
+        }
+        for (size_t k = 2; k < kBlocks; ++ ++k)
         {
             {
                 const tBlockMatrix_A &tBlockA = blockA.sliceN<kBlockWidth>(k);
-                __global2smem_async(smemA1, tBlockA.copyT());
                 const tBlockMatrix_B &tBlockB = blockB.sliceM<kBlockWidth>(k);
-                __global2smem_async(smemB1, tBlockB.copyT());
-                for (size_t kCoreIndex = 0; kCoreIndex < kWarpCores; kCoreIndex += 2)
+                __global2smem_async(smemA0, tBlockA.copyT(), 0);
+                __global2smem_async(smemA0, tBlockA.copyT(), 1);
+                __global2smem_async(smemA0, tBlockA.copyT(), 2);
+                __global2smem_async(smemA0, tBlockA.copyT(), 3);
                 {
+                    const auto &_A = warpmemA1.sliceN<kCoreWidth>(0);
+                    const auto &_B = warpmemB1.sliceM<kCoreWidth>(0);
+                    for (size_t i = 0; i < 4; ++i)
                     {
-                        for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                            for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
-                                MMA(mmaReg[0].A0[mCoreIndex], mmaReg[0].A1[mCoreIndex], mmaReg[0].A2[mCoreIndex], mmaReg[0].A3[mCoreIndex],
-                                    mmaReg[0].B0[nCoreIndex], mmaReg[0].B1[nCoreIndex],
-                                    C0[mCoreIndex][nCoreIndex], C1[mCoreIndex][nCoreIndex], C2[mCoreIndex][nCoreIndex], C3[mCoreIndex][nCoreIndex]);
-                        const auto &_A = warpmemA0.sliceN<kCoreWidth>(kCoreIndex);
-                        const auto &_B = warpmemB0.sliceM<kCoreWidth>(kCoreIndex);
-                        for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                        {
-                            __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(mCoreIndex)),
-                                        mmaReg[1].A0[mCoreIndex],
-                                        mmaReg[1].A1[mCoreIndex],
-                                        mmaReg[1].A2[mCoreIndex],
-                                        mmaReg[1].A3[mCoreIndex]);
-                        }
-                        for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores / 2; ++nCoreIndex)
-                        {
-                            __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(nCoreIndex)),
-                                        mmaReg[1].B0[nCoreIndex],
-                                        mmaReg[1].B1[nCoreIndex],
-                                        mmaReg[1].B0[nCoreIndex + 1],
-                                        mmaReg[1].B1[nCoreIndex + 1]);
-                        }
+                        for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                            MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                                mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                    mmaReg[1].A[0][i],
+                                    mmaReg[1].A[1][i],
+                                    mmaReg[1].A[2][i],
+                                    mmaReg[1].A[3][i]);
+                        for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                            MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                                mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                     mmaReg[1].B[0][i * 2],
+                                     mmaReg[1].B[1][i * 2],
+                                     mmaReg[1].B[0][i * 2 + 1],
+                                     mmaReg[1].B[1][i * 2 + 1]);
                     }
+                }
+                __global2smem_async(smemA0, tBlockA.copyT(), 4);
+                __global2smem_async(smemA0, tBlockA.copyT(), 5);
+                __global2smem_async(smemA0, tBlockA.copyT(), 6);
+                __global2smem_async(smemA0, tBlockA.copyT(), 7);
+                {
+                    const auto &_A = warpmemA1.sliceN<kCoreWidth>(1);
+                    const auto &_B = warpmemB1.sliceM<kCoreWidth>(1);
+                    for (size_t i = 0; i < 4; ++i)
                     {
-                        for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                            for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
-                                MMA(mmaReg[1].A0[mCoreIndex], mmaReg[1].A1[mCoreIndex], mmaReg[1].A2[mCoreIndex], mmaReg[1].A3[mCoreIndex],
-                                    mmaReg[1].B0[nCoreIndex], mmaReg[1].B1[nCoreIndex],
-                                    C0[mCoreIndex][nCoreIndex], C1[mCoreIndex][nCoreIndex], C2[mCoreIndex][nCoreIndex], C3[mCoreIndex][nCoreIndex]);
-                        const auto &_A = warpmemA0.sliceN<kCoreWidth>(kCoreIndex + 1);
-                        const auto &_B = warpmemB0.sliceM<kCoreWidth>(kCoreIndex + 1);
-                        for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                        {
-                            __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(mCoreIndex)),
-                                        mmaReg[0].A0[mCoreIndex],
-                                        mmaReg[0].A1[mCoreIndex],
-                                        mmaReg[0].A2[mCoreIndex],
-                                        mmaReg[0].A3[mCoreIndex]);
-                        }
-                        for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores / 2; ++nCoreIndex)
-                        {
-                            __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(nCoreIndex)),
-                                        mmaReg[0].B0[nCoreIndex],
-                                        mmaReg[0].B1[nCoreIndex],
-                                        mmaReg[0].B0[nCoreIndex + 1],
-                                        mmaReg[0].B1[nCoreIndex + 1]);
-                        }
+                        for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                            MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                                mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                    mmaReg[0].A[0][i],
+                                    mmaReg[0].A[1][i],
+                                    mmaReg[0].A[2][i],
+                                    mmaReg[0].A[3][i]);
+                        for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                            MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                                mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                     mmaReg[0].B[0][i * 2],
+                                     mmaReg[0].B[1][i * 2],
+                                     mmaReg[0].B[0][i * 2 + 1],
+                                     mmaReg[0].B[1][i * 2 + 1]);
+                    }
+                }
+                __global2smem_async(smemB0, tBlockB.copyT(), 0);
+                __global2smem_async(smemB0, tBlockB.copyT(), 1);
+                __global2smem_async(smemB0, tBlockB.copyT(), 2);
+                __global2smem_async(smemB0, tBlockB.copyT(), 3);
+                __async_commit();
+                {
+                    const auto &_A = warpmemA1.sliceN<kCoreWidth>(2);
+                    const auto &_B = warpmemB1.sliceM<kCoreWidth>(2);
+                    for (size_t i = 0; i < 4; ++i)
+                    {
+                        for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                            MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                                mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                    mmaReg[1].A[0][i],
+                                    mmaReg[1].A[1][i],
+                                    mmaReg[1].A[2][i],
+                                    mmaReg[1].A[3][i]);
+                        for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                            MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                                mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                     mmaReg[1].B[0][i * 2],
+                                     mmaReg[1].B[1][i * 2],
+                                     mmaReg[1].B[0][i * 2 + 1],
+                                     mmaReg[1].B[1][i * 2 + 1]);
+                    }
+                }
+                {
+                    const auto &_A = warpmemA1.sliceN<kCoreWidth>(3);
+                    const auto &_B = warpmemB1.sliceM<kCoreWidth>(3);
+                    for (size_t i = 0; i < 4; ++i)
+                    {
+                        for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                            MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                                mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                    mmaReg[0].A[0][i],
+                                    mmaReg[0].A[1][i],
+                                    mmaReg[0].A[2][i],
+                                    mmaReg[0].A[3][i]);
+                        for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                            MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                                mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                     mmaReg[0].B[0][i * 2],
+                                     mmaReg[0].B[1][i * 2],
+                                     mmaReg[0].B[0][i * 2 + 1],
+                                     mmaReg[0].B[1][i * 2 + 1]);
                     }
                 }
                 __async_wait();
             }
             {
                 const tBlockMatrix_A &tBlockA = blockA.sliceN<kBlockWidth>(k + 1);
-                __global2smem_async(smemA0, tBlockA.copyT());
                 const tBlockMatrix_B &tBlockB = blockB.sliceM<kBlockWidth>(k + 1);
-                __global2smem_async(smemB0, tBlockB.copyT());
-                for (size_t kCoreIndex = 0; kCoreIndex < kWarpCores; kCoreIndex += 2)
+                __global2smem_async(smemA1, tBlockA.copyT(), 0);
+                __global2smem_async(smemA1, tBlockA.copyT(), 1);
+                __global2smem_async(smemA1, tBlockA.copyT(), 2);
+                __global2smem_async(smemA1, tBlockA.copyT(), 3);
                 {
+                    const auto &_A = warpmemA0.sliceN<kCoreWidth>(0);
+                    const auto &_B = warpmemB0.sliceM<kCoreWidth>(0);
+                    for (size_t i = 0; i < 4; ++i)
                     {
-                        for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                            for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
-                                MMA(mmaReg[0].A0[mCoreIndex], mmaReg[0].A1[mCoreIndex], mmaReg[0].A2[mCoreIndex], mmaReg[0].A3[mCoreIndex],
-                                    mmaReg[0].B0[nCoreIndex], mmaReg[0].B1[nCoreIndex],
-                                    C0[mCoreIndex][nCoreIndex], C1[mCoreIndex][nCoreIndex], C2[mCoreIndex][nCoreIndex], C3[mCoreIndex][nCoreIndex]);
-                        const auto &_A = warpmemA1.sliceN<kCoreWidth>(kCoreIndex);
-                        const auto &_B = warpmemB1.sliceM<kCoreWidth>(kCoreIndex);
-                        for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                        {
-                            __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(mCoreIndex)),
-                                        mmaReg[1].A0[mCoreIndex],
-                                        mmaReg[1].A1[mCoreIndex],
-                                        mmaReg[1].A2[mCoreIndex],
-                                        mmaReg[1].A3[mCoreIndex]);
-                        }
-                        for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores / 2; ++nCoreIndex)
-                        {
-                            __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(nCoreIndex)),
-                                        mmaReg[1].B0[nCoreIndex],
-                                        mmaReg[1].B1[nCoreIndex],
-                                        mmaReg[1].B0[nCoreIndex + 1],
-                                        mmaReg[1].B1[nCoreIndex + 1]);
-                        }
+                        for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                            MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                                mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                    mmaReg[1].A[0][i],
+                                    mmaReg[1].A[1][i],
+                                    mmaReg[1].A[2][i],
+                                    mmaReg[1].A[3][i]);
+                        for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                            MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                                mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                     mmaReg[1].B[0][i * 2],
+                                     mmaReg[1].B[1][i * 2],
+                                     mmaReg[1].B[0][i * 2 + 1],
+                                     mmaReg[1].B[1][i * 2 + 1]);
                     }
+                }
+                __global2smem_async(smemA1, tBlockA.copyT(), 4);
+                __global2smem_async(smemA1, tBlockA.copyT(), 5);
+                __global2smem_async(smemA1, tBlockA.copyT(), 6);
+                __global2smem_async(smemA1, tBlockA.copyT(), 7);
+                {
+                    const auto &_A = warpmemA0.sliceN<kCoreWidth>(1);
+                    const auto &_B = warpmemB0.sliceM<kCoreWidth>(1);
+                    for (size_t i = 0; i < 4; ++i)
                     {
-                        for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                            for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
-                                MMA(mmaReg[1].A0[mCoreIndex], mmaReg[1].A1[mCoreIndex], mmaReg[1].A2[mCoreIndex], mmaReg[1].A3[mCoreIndex],
-                                    mmaReg[1].B0[nCoreIndex], mmaReg[1].B1[nCoreIndex],
-                                    C0[mCoreIndex][nCoreIndex], C1[mCoreIndex][nCoreIndex], C2[mCoreIndex][nCoreIndex], C3[mCoreIndex][nCoreIndex]);
-                        const auto &_A = warpmemA1.sliceN<kCoreWidth>(kCoreIndex + 1);
-                        const auto &_B = warpmemB1.sliceM<kCoreWidth>(kCoreIndex + 1);
-                        for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                        {
-                            __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(mCoreIndex)),
-                                        mmaReg[0].A0[mCoreIndex],
-                                        mmaReg[0].A1[mCoreIndex],
-                                        mmaReg[0].A2[mCoreIndex],
-                                        mmaReg[0].A3[mCoreIndex]);
-                        }
-                        for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores / 2; ++nCoreIndex)
-                        {
-                            __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(nCoreIndex)),
-                                        mmaReg[0].B0[nCoreIndex],
-                                        mmaReg[0].B1[nCoreIndex],
-                                        mmaReg[0].B0[nCoreIndex + 1],
-                                        mmaReg[0].B1[nCoreIndex + 1]);
-                        }
+                        for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                            MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                                mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                    mmaReg[0].A[0][i],
+                                    mmaReg[0].A[1][i],
+                                    mmaReg[0].A[2][i],
+                                    mmaReg[0].A[3][i]);
+                        for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                            MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                                mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                     mmaReg[0].B[0][i * 2],
+                                     mmaReg[0].B[1][i * 2],
+                                     mmaReg[0].B[0][i * 2 + 1],
+                                     mmaReg[0].B[1][i * 2 + 1]);
+                    }
+                }
+                __global2smem_async(smemB1, tBlockB.copyT(), 0);
+                __global2smem_async(smemB1, tBlockB.copyT(), 1);
+                __global2smem_async(smemB1, tBlockB.copyT(), 2);
+                __global2smem_async(smemB1, tBlockB.copyT(), 3);
+                __async_commit();
+                {
+                    const auto &_A = warpmemA0.sliceN<kCoreWidth>(2);
+                    const auto &_B = warpmemB0.sliceM<kCoreWidth>(2);
+                    for (size_t i = 0; i < 4; ++i)
+                    {
+                        for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                            MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                                mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                    mmaReg[1].A[0][i],
+                                    mmaReg[1].A[1][i],
+                                    mmaReg[1].A[2][i],
+                                    mmaReg[1].A[3][i]);
+                        for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                            MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                                mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                     mmaReg[1].B[0][i * 2],
+                                     mmaReg[1].B[1][i * 2],
+                                     mmaReg[1].B[0][i * 2 + 1],
+                                     mmaReg[1].B[1][i * 2 + 1]);
+                    }
+                }
+                {
+                    const auto &_A = warpmemA0.sliceN<kCoreWidth>(3);
+                    const auto &_B = warpmemB0.sliceM<kCoreWidth>(3);
+                    for (size_t i = 0; i < 4; ++i)
+                    {
+                        for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                            MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                                mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                    mmaReg[0].A[0][i],
+                                    mmaReg[0].A[1][i],
+                                    mmaReg[0].A[2][i],
+                                    mmaReg[0].A[3][i]);
+                        for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                            MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                                mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                                C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                        __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                     mmaReg[0].B[0][i * 2],
+                                     mmaReg[0].B[1][i * 2],
+                                     mmaReg[0].B[0][i * 2 + 1],
+                                     mmaReg[0].B[1][i * 2 + 1]);
                     }
                 }
                 __async_wait();
             }
         }
         {
-            const tBlockMatrix_A &tBlockA = blockA.sliceN<kBlockWidth>(kBlocks - 1);
-            __global2smem_async(smemA1, tBlockA.copyT());
-            const tBlockMatrix_B &tBlockB = blockB.sliceM<kBlockWidth>(kBlocks - 1);
-            __global2smem_async(smemB1, tBlockB.copyT());
-            for (size_t kCoreIndex = 0; kCoreIndex < kWarpCores; kCoreIndex += 2)
             {
+                const auto &_A = warpmemA1.sliceN<kCoreWidth>(0);
+                const auto &_B = warpmemB1.sliceM<kCoreWidth>(0);
+                for (size_t i = 0; i < 4; ++i)
                 {
-                    for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                        for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
-                            MMA(mmaReg[0].A0[mCoreIndex], mmaReg[0].A1[mCoreIndex], mmaReg[0].A2[mCoreIndex], mmaReg[0].A3[mCoreIndex],
-                                mmaReg[0].B0[nCoreIndex], mmaReg[0].B1[nCoreIndex],
-                                C0[mCoreIndex][nCoreIndex], C1[mCoreIndex][nCoreIndex], C2[mCoreIndex][nCoreIndex], C3[mCoreIndex][nCoreIndex]);
-                    const auto &_A = warpmemA0.sliceN<kCoreWidth>(kCoreIndex);
-                    const auto &_B = warpmemB0.sliceM<kCoreWidth>(kCoreIndex);
-                    for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                    {
-                        __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(mCoreIndex)),
-                                    mmaReg[1].A0[mCoreIndex],
-                                    mmaReg[1].A1[mCoreIndex],
-                                    mmaReg[1].A2[mCoreIndex],
-                                    mmaReg[1].A3[mCoreIndex]);
-                    }
-                    for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores / 2; ++nCoreIndex)
-                    {
-                        __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(nCoreIndex)),
-                                    mmaReg[1].B0[nCoreIndex],
-                                    mmaReg[1].B1[nCoreIndex],
-                                    mmaReg[1].B0[nCoreIndex + 1],
-                                    mmaReg[1].B1[nCoreIndex + 1]);
-                    }
-                }
-                {
-                    for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                        for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
-                            MMA(mmaReg[1].A0[mCoreIndex], mmaReg[1].A1[mCoreIndex], mmaReg[1].A2[mCoreIndex], mmaReg[1].A3[mCoreIndex],
-                                mmaReg[1].B0[nCoreIndex], mmaReg[1].B1[nCoreIndex],
-                                C0[mCoreIndex][nCoreIndex], C1[mCoreIndex][nCoreIndex], C2[mCoreIndex][nCoreIndex], C3[mCoreIndex][nCoreIndex]);
-                    const auto &_A = warpmemA0.sliceN<kCoreWidth>(kCoreIndex + 1);
-                    const auto &_B = warpmemB0.sliceM<kCoreWidth>(kCoreIndex + 1);
-                    for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                    {
-                        __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(mCoreIndex)),
-                                    mmaReg[0].A0[mCoreIndex],
-                                    mmaReg[0].A1[mCoreIndex],
-                                    mmaReg[0].A2[mCoreIndex],
-                                    mmaReg[0].A3[mCoreIndex]);
-                    }
-                    for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores / 2; ++nCoreIndex)
-                    {
-                        __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(nCoreIndex)),
-                                    mmaReg[0].B0[nCoreIndex],
-                                    mmaReg[0].B1[nCoreIndex],
-                                    mmaReg[0].B0[nCoreIndex + 1],
-                                    mmaReg[0].B1[nCoreIndex + 1]);
-                    }
+                    for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                        MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                            mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                mmaReg[1].A[0][i],
+                                mmaReg[1].A[1][i],
+                                mmaReg[1].A[2][i],
+                                mmaReg[1].A[3][i]);
+                    for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                        MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                            mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                 mmaReg[1].B[0][i * 2],
+                                 mmaReg[1].B[1][i * 2],
+                                 mmaReg[1].B[0][i * 2 + 1],
+                                 mmaReg[1].B[1][i * 2 + 1]);
                 }
             }
-            __async_wait();
-        }
-        {
-            for (size_t kCoreIndex = 0; kCoreIndex < kWarpCores; kCoreIndex += 2)
             {
+                const auto &_A = warpmemA1.sliceN<kCoreWidth>(1);
+                const auto &_B = warpmemB1.sliceM<kCoreWidth>(1);
+                for (size_t i = 0; i < 4; ++i)
                 {
-                    for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                        for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
-                            MMA(mmaReg[0].A0[mCoreIndex], mmaReg[0].A1[mCoreIndex], mmaReg[0].A2[mCoreIndex], mmaReg[0].A3[mCoreIndex],
-                                mmaReg[0].B0[nCoreIndex], mmaReg[0].B1[nCoreIndex],
-                                C0[mCoreIndex][nCoreIndex], C1[mCoreIndex][nCoreIndex], C2[mCoreIndex][nCoreIndex], C3[mCoreIndex][nCoreIndex]);
-                    const auto &_A = warpmemA1.sliceN<kCoreWidth>(kCoreIndex);
-                    const auto &_B = warpmemB1.sliceM<kCoreWidth>(kCoreIndex);
-                    for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                    {
-                        __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(mCoreIndex)),
-                                    mmaReg[1].A0[mCoreIndex],
-                                    mmaReg[1].A1[mCoreIndex],
-                                    mmaReg[1].A2[mCoreIndex],
-                                    mmaReg[1].A3[mCoreIndex]);
-                    }
-                    for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores / 2; ++nCoreIndex)
-                    {
-                        __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(nCoreIndex)),
-                                    mmaReg[1].B0[nCoreIndex],
-                                    mmaReg[1].B1[nCoreIndex],
-                                    mmaReg[1].B0[nCoreIndex + 1],
-                                    mmaReg[1].B1[nCoreIndex + 1]);
-                    }
+                    for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                        MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                            mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                mmaReg[0].A[0][i],
+                                mmaReg[0].A[1][i],
+                                mmaReg[0].A[2][i],
+                                mmaReg[0].A[3][i]);
+                    for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                        MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                            mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                 mmaReg[0].B[0][i * 2],
+                                 mmaReg[0].B[1][i * 2],
+                                 mmaReg[0].B[0][i * 2 + 1],
+                                 mmaReg[0].B[1][i * 2 + 1]);
                 }
+            }
+            {
+                const auto &_A = warpmemA1.sliceN<kCoreWidth>(2);
+                const auto &_B = warpmemB1.sliceM<kCoreWidth>(2);
+                for (size_t i = 0; i < 4; ++i)
                 {
-                    for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                        for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
-                            MMA(mmaReg[1].A0[mCoreIndex], mmaReg[1].A1[mCoreIndex], mmaReg[1].A2[mCoreIndex], mmaReg[1].A3[mCoreIndex],
-                                mmaReg[1].B0[nCoreIndex], mmaReg[1].B1[nCoreIndex],
-                                C0[mCoreIndex][nCoreIndex], C1[mCoreIndex][nCoreIndex], C2[mCoreIndex][nCoreIndex], C3[mCoreIndex][nCoreIndex]);
-                    const auto &_A = warpmemA1.sliceN<kCoreWidth>(kCoreIndex + 1);
-                    const auto &_B = warpmemB1.sliceM<kCoreWidth>(kCoreIndex + 1);
-                    for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-                    {
-                        const MMA_A &A = *(const MMA_A *)&(_A.sliceM<mCoreWidth>(mCoreIndex));
-                        mmaReg[0].A0[mCoreIndex] = A.get0();
-                        mmaReg[0].A1[mCoreIndex] = A.get1();
-                        mmaReg[0].A2[mCoreIndex] = A.get2();
-                        mmaReg[0].A3[mCoreIndex] = A.get3();
-                    }
-                    for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
-                    {
-                        const MMA_B &B = *(const MMA_B *)&(_B.sliceN<nCoreWidth>(nCoreIndex));
-                        mmaReg[0].B0[nCoreIndex] = B.get0();
-                        mmaReg[0].B1[nCoreIndex] = B.get1();
-                    }
+                    for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                        MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                            mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                mmaReg[1].A[0][i],
+                                mmaReg[1].A[1][i],
+                                mmaReg[1].A[2][i],
+                                mmaReg[1].A[3][i]);
+                    for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                        MMA(mmaReg[0].A[0][i], mmaReg[0].A[1][i], mmaReg[0].A[2][i], mmaReg[0].A[3][i],
+                            mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                 mmaReg[1].B[0][i * 2],
+                                 mmaReg[1].B[1][i * 2],
+                                 mmaReg[1].B[0][i * 2 + 1],
+                                 mmaReg[1].B[1][i * 2 + 1]);
+                }
+            }
+            {
+                const auto &_A = warpmemA1.sliceN<kCoreWidth>(3);
+                const auto &_B = warpmemB1.sliceM<kCoreWidth>(3);
+                for (size_t i = 0; i < 4; ++i)
+                {
+                    for (size_t nCoreIndex = 0; nCoreIndex < 4; ++nCoreIndex)
+                        MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                            mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixA(*(const MMA_A *)&(_A.sliceM<mCoreWidth>(i)),
+                                mmaReg[0].A[0][i],
+                                mmaReg[0].A[1][i],
+                                mmaReg[0].A[2][i],
+                                mmaReg[0].A[3][i]);
+                    for (size_t nCoreIndex = 4; nCoreIndex < 8; ++nCoreIndex)
+                        MMA(mmaReg[1].A[0][i], mmaReg[1].A[1][i], mmaReg[1].A[2][i], mmaReg[1].A[3][i],
+                            mmaReg[1].B[0][nCoreIndex], mmaReg[1].B[1][nCoreIndex],
+                            C[0][i][nCoreIndex], C[1][i][nCoreIndex], C[2][i][nCoreIndex], C[3][i][nCoreIndex]);
+                    __ldmatrixB2(*(const MMA_B2 *)&(_B.sliceN<nCoreWidth * 2>(i)),
+                                 mmaReg[0].B[0][i * 2],
+                                 mmaReg[0].B[1][i * 2],
+                                 mmaReg[0].B[0][i * 2 + 1],
+                                 mmaReg[0].B[1][i * 2 + 1]);
                 }
             }
         }
+        auto &____C = blockC.sliceM<mWarpWidth>(mWarpIndex);
+        auto &___C = ____C.sliceN<nWarpWidth>(nWarpIndex);
         for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
+        {
+            auto &__C = ___C.sliceM<mCoreWidth>(mCoreIndex);
             for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
-                MMA(mmaReg[1].A0[mCoreIndex], mmaReg[1].A1[mCoreIndex], mmaReg[1].A2[mCoreIndex], mmaReg[1].A3[mCoreIndex],
-                    mmaReg[1].B0[nCoreIndex], mmaReg[1].B1[nCoreIndex],
-                    C0[mCoreIndex][nCoreIndex], C1[mCoreIndex][nCoreIndex], C2[mCoreIndex][nCoreIndex], C3[mCoreIndex][nCoreIndex]);
-
-        auto &___C = blockC.sliceM<mWarpWidth>(mWarpIndex);
-        auto &__C = ___C.sliceN<nWarpWidth>(nWarpIndex);
-        for (size_t mCoreIndex = 0; mCoreIndex < mWarpCores; ++mCoreIndex)
-        {
-            auto &_C = __C.sliceM<mCoreWidth>(mCoreIndex);
-            for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; nCoreIndex += 4)
             {
-                MMA_C_Global &C = *(MMA_C_Global *)&(_C.sliceN<nCoreWidth>(nCoreIndex));
-                C.ref0().layout = C0[mCoreIndex][nCoreIndex].layout;
-                C.ref1().layout = C1[mCoreIndex][nCoreIndex].layout;
-                C.ref2().layout = C2[mCoreIndex][nCoreIndex].layout;
-                C.ref3().layout = C3[mCoreIndex][nCoreIndex].layout;
+                MMA(mmaReg[0].A[0][mCoreIndex], mmaReg[0].A[1][mCoreIndex], mmaReg[0].A[2][mCoreIndex], mmaReg[0].A[3][mCoreIndex],
+                    mmaReg[0].B[0][nCoreIndex], mmaReg[0].B[1][nCoreIndex],
+                    C[0][mCoreIndex][nCoreIndex], C[1][mCoreIndex][nCoreIndex], C[2][mCoreIndex][nCoreIndex], C[3][mCoreIndex][nCoreIndex]);
+            }
+            for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
+            {
+                asm volatile(
+                    "st.shared.v2.u32 [%0], {%1, %2};\n"
+                    :
+                    : "r"((__uint32_t)__cvta_generic_to_shared(&(warpmemC[(threadIdx.x % warpSize) / 4][nCoreIndex * 8 + (threadIdx.x % 4) * 2]))), "r"(C[0][mCoreIndex][nCoreIndex].reg), "r"(C[1][mCoreIndex][nCoreIndex].reg));
+                // warpmemC[(threadIdx.x % warpSize) / 4][(threadIdx.x % 4) * 2] = C[0][mCoreIndex][nCoreIndex].layout;
+                // warpmemC[(threadIdx.x % warpSize) / 4][(threadIdx.x % 4) * 2 + 1] = C[1][mCoreIndex][nCoreIndex].layout;
+            }
+            for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
+            {
+                asm volatile(
+                    "st.shared.v2.u32 [%0], {%1, %2};\n"
+                    :
+                    : "r"((__uint32_t)__cvta_generic_to_shared(&(warpmemC[(threadIdx.x % warpSize) / 4 + 8][nCoreIndex * 8 + (threadIdx.x % 4) * 2]))), "r"(C[2][mCoreIndex][nCoreIndex].reg), "r"(C[3][mCoreIndex][nCoreIndex].reg));
+                // warpmemC[(threadIdx.x % warpSize) / 4 + 8][(threadIdx.x % 4) * 2] = C[2][mCoreIndex][nCoreIndex].layout;
+                // warpmemC[(threadIdx.x % warpSize) / 4 + 8][(threadIdx.x % 4) * 2 + 1] = C[3][mCoreIndex][nCoreIndex].layout;
+            }
+            for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
+            {
+                asm volatile(
+                    "ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                    : "=r"(C[0][mCoreIndex][nCoreIndex].reg), "=r"(C[1][mCoreIndex][nCoreIndex].reg), "=r"(C[2][mCoreIndex][nCoreIndex].reg), "=r"(C[3][mCoreIndex][nCoreIndex].reg)
+                    : "r"((__uint32_t)__cvta_generic_to_shared(&(warpmemC[(threadIdx.x % warpSize) / 2][nCoreIndex * 8 + (threadIdx.x % 2) * 4]))));
+                // C[0][mCoreIndex][nCoreIndex].layout = warpmemC[(threadIdx.x % warpSize) / 2][(threadIdx.x % 2) * 4 + 0];
+                // C[1][mCoreIndex][nCoreIndex].layout = warpmemC[(threadIdx.x % warpSize) / 2][(threadIdx.x % 2) * 4 + 1];
+                // C[2][mCoreIndex][nCoreIndex].layout = warpmemC[(threadIdx.x % warpSize) / 2][(threadIdx.x % 2) * 4 + 2];
+                // C[3][mCoreIndex][nCoreIndex].layout = warpmemC[(threadIdx.x % warpSize) / 2][(threadIdx.x % 2) * 4 + 3];
+            }
+            for (size_t nCoreIndex = 0; nCoreIndex < nWarpCores; ++nCoreIndex)
+            {
+                MMA_C_Global &_C = *(MMA_C_Global *)&(__C.sliceN<nCoreWidth>(nCoreIndex));
+                asm volatile(
+                    "st.global.v4.u32 [%0], {%1, %2, %3, %4};\n"
+                    :
+                    : "l"(&(_C[(threadIdx.x % warpSize) / 2][(threadIdx.x % 2) * 4])),
+                      "r"(C[0][mCoreIndex][nCoreIndex].reg),
+                      "r"(C[1][mCoreIndex][nCoreIndex].reg),
+                      "r"(C[2][mCoreIndex][nCoreIndex].reg),
+                      "r"(C[3][mCoreIndex][nCoreIndex].reg));
             }
         }
     }
 };
 template <size_t M, size_t K, size_t N>
-__global__ void mma_gemm(const half *A, const half *B, float *C)
+__global__ void ptx_gemm_max_perf(const half *A, const half *B, float *C)
 {
-    __launch_bounds__(MMA_GEMM<M, K, N>::mBlockWarps * MMA_GEMM<M, K, N>::nBlockWarps * MMA_GEMM<M, K, N>::WarpSize);
-    extern __shared__ typename MMA_GEMM<M, K, N>::Smem smem[];
-    MMA_GEMM<M, K, N>::gemm(smem, (const typename MMA_GEMM<M, K, N>::GlobalMatrix_A *)A, (const typename MMA_GEMM<M, K, N>::GlobalMatrix_B *)B, (typename MMA_GEMM<M, K, N>::GlobalMatrix_C *)C);
+    static constexpr size_t mode = 0;
+    __launch_bounds__(PTX_GEMM<M, K, N, mode>::mBlockWarps * PTX_GEMM<M, K, N, mode>::nBlockWarps * PTX_GEMM<M, K, N, mode>::WarpSize);
+    extern __shared__ typename PTX_GEMM<M, K, N, mode>::Smem smem0[];
+    PTX_GEMM<M, K, N, mode>::gemm(smem0, (const typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_A *)A, (const typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_B *)B, (typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_C *)C);
+}
+template <size_t M, size_t K, size_t N>
+__global__ void ptx_gemm_conflict_ldgsts(const half *A, const half *B, float *C)
+{
+    static constexpr size_t mode = 1;
+    __launch_bounds__(PTX_GEMM<M, K, N, mode>::mBlockWarps * PTX_GEMM<M, K, N, mode>::nBlockWarps * PTX_GEMM<M, K, N, mode>::WarpSize);
+    extern __shared__ typename PTX_GEMM<M, K, N, mode>::Smem smem1[];
+    PTX_GEMM<M, K, N, mode>::gemm(smem1, (const typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_A *)A, (const typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_B *)B, (typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_C *)C);
+}
+template <size_t M, size_t K, size_t N>
+__global__ void ptx_gemm_confilct_ldmatrix(const half *A, const half *B, float *C)
+{
+    static constexpr size_t mode = 2;
+    __launch_bounds__(PTX_GEMM<M, K, N, mode>::mBlockWarps * PTX_GEMM<M, K, N, mode>::nBlockWarps * PTX_GEMM<M, K, N, mode>::WarpSize);
+    extern __shared__ typename PTX_GEMM<M, K, N, mode>::Smem smem2[];
+    PTX_GEMM<M, K, N, mode>::gemm(smem2, (const typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_A *)A, (const typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_B *)B, (typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_C *)C);
+}
+template <size_t M, size_t K, size_t N>
+__global__ void ptx_gemm_no_padding(const half *A, const half *B, float *C)
+{
+    static constexpr size_t mode = 3;
+    __launch_bounds__(PTX_GEMM<M, K, N, mode>::mBlockWarps * PTX_GEMM<M, K, N, mode>::nBlockWarps * PTX_GEMM<M, K, N, mode>::WarpSize);
+    extern __shared__ typename PTX_GEMM<M, K, N, mode>::Smem smem3[];
+    PTX_GEMM<M, K, N, mode>::gemm(smem3, (const typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_A *)A, (const typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_B *)B, (typename PTX_GEMM<M, K, N, mode>::GlobalMatrix_C *)C);
 }

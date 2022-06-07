@@ -8,31 +8,9 @@
 #undef private
 #include "ptx_gemm.h"
 using namespace nvcuda::wmma;
-static constexpr size_t mBlockWarps = 2;
-static constexpr size_t nBlockWarps = 8;
-static constexpr size_t kBlockWarps = 2;
-static constexpr size_t mWarpCores = 4;
-static constexpr size_t nWarpCores = 2;
-static constexpr size_t kWarpCores = 1;
-static constexpr size_t smemPad = 8;
-static constexpr size_t mCoreWidth = 16;
-static constexpr size_t nCoreWidth = 16;
-static constexpr size_t kCoreWidth = 16;
-using copy_t = int4;
-static constexpr size_t WarpSize = 32;
 template <size_t M, size_t K, size_t N>
 class MatMul
 {
-    static constexpr size_t mWarpWidth = mWarpCores * mCoreWidth;
-    static constexpr size_t nWarpWidth = nWarpCores * nCoreWidth;
-    static constexpr size_t mBlockCores = mBlockWarps * mWarpCores;
-    static constexpr size_t nBlockCores = nBlockWarps * nWarpCores;
-    static constexpr size_t kBlockCores = kBlockWarps * kWarpCores;
-    static constexpr size_t mBlockWidth = mBlockCores * mCoreWidth;
-    static constexpr size_t nBlockWidth = nBlockCores * nCoreWidth;
-    static constexpr size_t kBlockWidth = kBlockCores * kCoreWidth;
-    static constexpr size_t mBlocks = M / mBlockWidth;
-    static constexpr size_t nBlocks = N / nBlockWidth;
     cublasHandle_t handle;
     half *A;
     half *B;
@@ -45,8 +23,8 @@ class MatMul
     float beta;
     using ElementAccumulator = float;                  // <- data type of accumulator
     using ElementComputeEpilogue = ElementAccumulator; // <- data type of epilogue operations
-    using ElementInputA = cutlass::half_t;                        // <- data type of elements in input matrix A
-    using ElementInputB = cutlass::half_t;                        // <- data type of elements in input matrix B
+    using ElementInputA = cutlass::half_t;             // <- data type of elements in input matrix A
+    using ElementInputB = cutlass::half_t;             // <- data type of elements in input matrix B
     using ElementOutput = float;                       // <- data type of elements in output matrix D
     // The code section below describes matrix layout of input and output matrices. Column Major for
     // Matrix A, Row Major for Matrix B and Row Major for Matrix C
@@ -59,7 +37,7 @@ class MatMul
     using SmArch = cutlass::arch::Sm80;
     // This code section describes the tile size a thread block will compute
     using ShapeMMAThreadBlock =
-        cutlass::gemm::GemmShape<128, 128, 32>; // <- threadblock tile M = 128, N = 128, K = 32
+        cutlass::gemm::GemmShape<128, 256, 32>; // <- threadblock tile M = 128, N = 256, K = 32
     // This code section describes tile size a warp will compute
     using ShapeMMAWarp = cutlass::gemm::GemmShape<64, 64, 32>; // <- warp tile M = 64, N = 64, K = 32
     // This code section describes the size of MMA op
@@ -75,7 +53,7 @@ class MatMul
                                                           // math instructions in the epilogue too
         ElementAccumulator,                               // <- data type of accumulator
         ElementComputeEpilogue,                           // <- data type for alpha/beta in linear combination function
-	cutlass::epilogue::thread::ScaleType::NoBetaScaling>;
+        cutlass::epilogue::thread::ScaleType::NoBetaScaling>;
     // Number of pipelines you want to use
     static constexpr int NumStages = 4;
     using CutlassGemm = cutlass::gemm::device::Gemm<ElementInputA,
@@ -98,9 +76,13 @@ class MatMul
     dim3 grid;
     dim3 block;
     size_t smem_size;
+
+    static constexpr size_t ptxGemmMode = 0;
+
 public:
     MatMul(void *_buffer = nullptr) : buffer(_buffer), alpha(1.0f), beta(0.0f)
     {
+        cudaSetDevice(1);
         cublasCreate_v2(&handle);
         const size_t absize = (M * K + K * N) * sizeof(half);
         const size_t csize = (M * N) * sizeof(float);
@@ -117,37 +99,56 @@ public:
         cudaMalloc(&dA, M * K * sizeof(half));
         cudaMalloc(&dB, K * N * sizeof(half));
         cudaMalloc(&dC, M * N * sizeof(float));
-        args = new CutlassGemm::Arguments(cutlass::gemm::GemmCoord(M, N, K), 
-			cutlass::TensorRef<const cutlass::half_t, cutlass::layout::RowMajor>((cutlass::half_t*)dA, K), 
-			cutlass::TensorRef<const cutlass::half_t, cutlass::layout::RowMajor>((cutlass::half_t*)dB, N), 
-			cutlass::TensorRef<const float, cutlass::layout::RowMajor>(dC, N), 
-			cutlass::TensorRef<float, cutlass::layout::RowMajor>(dC, N));
+        args = new CutlassGemm::Arguments(cutlass::gemm::GemmCoord(M, N, K),
+                                          cutlass::TensorRef<const cutlass::half_t, cutlass::layout::RowMajor>((cutlass::half_t *)dA, K),
+                                          cutlass::TensorRef<const cutlass::half_t, cutlass::layout::RowMajor>((cutlass::half_t *)dB, N),
+                                          cutlass::TensorRef<const float, cutlass::layout::RowMajor>(dC, N),
+                                          cutlass::TensorRef<float, cutlass::layout::RowMajor>(dC, N));
         cutlass_gemm.initialize(*args);
-	SwizzleThreadBlock swizzle{};
-	grid = swizzle.get_grid_shape(cutlass_gemm.params_.grid_tiled_shape);
-	block = dim3(CutlassGemm::GemmKernel::kThreadCount, 1, 1);
-	smem_size = size_t(sizeof(typename CutlassGemm::GemmKernel::SharedStorage));
-	if(smem_size >= (0xC000)) cudaFuncSetAttribute(cutlass::Kernel<CutlassGemm::GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-	if(sizeof(typename MMA_GEMM<M, K, N>::Smem) >= (0xC000)) cudaFuncSetAttribute(mma_gemm<M, K, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(typename MMA_GEMM<M, K, N>::Smem));
+        SwizzleThreadBlock swizzle{};
+        grid = swizzle.get_grid_shape(cutlass_gemm.params_.grid_tiled_shape);
+        block = dim3(CutlassGemm::GemmKernel::kThreadCount, 1, 1);
+        smem_size = size_t(sizeof(typename CutlassGemm::GemmKernel::SharedStorage));
+        if (smem_size >= (0xC000))
+            cudaFuncSetAttribute(cutlass::Kernel<CutlassGemm::GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        if (sizeof(typename PTX_GEMM<M, K, N, 0>::Smem) >= (0xC000))
+            cudaFuncSetAttribute(ptx_gemm_max_perf<M, K, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(typename PTX_GEMM<M, K, N, 0>::Smem));
+        if (sizeof(typename PTX_GEMM<M, K, N, 1>::Smem) >= (0xC000))
+            cudaFuncSetAttribute(ptx_gemm_conflict_ldgsts<M, K, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(typename PTX_GEMM<M, K, N, 1>::Smem));
+        if (sizeof(typename PTX_GEMM<M, K, N, 2>::Smem) >= (0xC000))
+            cudaFuncSetAttribute(ptx_gemm_confilct_ldmatrix<M, K, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(typename PTX_GEMM<M, K, N, 2>::Smem));
+        if (sizeof(typename PTX_GEMM<M, K, N, 3>::Smem) >= (0xC000))
+            cudaFuncSetAttribute(ptx_gemm_no_padding<M, K, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(typename PTX_GEMM<M, K, N, 3>::Smem));
+        //cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
     }
     void run(int method = 0) const
     {
         switch (method)
         {
         case 0:
-            mma_gemm<M, K, N><<<dim3(MMA_GEMM<M, K, N>::nBlocks, MMA_GEMM<M, K, N>::mBlocks), (MMA_GEMM<M, K, N>::mBlockWarps * MMA_GEMM<M, K, N>::nBlockWarps) * MMA_GEMM<M, K, N>::WarpSize, sizeof(typename MMA_GEMM<M, K, N>::Smem)>>>(dA, dB, dC);
+            ptx_gemm_max_perf<M, K, N><<<dim3(PTX_GEMM<M, K, N, 0>::nBlocks, PTX_GEMM<M, K, N, 0>::mBlocks), (PTX_GEMM<M, K, N, 0>::mBlockWarps * PTX_GEMM<M, K, N, 0>::nBlockWarps) * PTX_GEMM<M, K, N, 0>::WarpSize, sizeof(typename PTX_GEMM<M, K, N, 0>::Smem)>>>(dA, dB, dC);
+            break;
+        case -1:
+            ptx_gemm_conflict_ldgsts<M, K, N><<<dim3(PTX_GEMM<M, K, N, 1>::nBlocks, PTX_GEMM<M, K, N, 1>::mBlocks), (PTX_GEMM<M, K, N, 1>::mBlockWarps * PTX_GEMM<M, K, N, 1>::nBlockWarps) * PTX_GEMM<M, K, N, 1>::WarpSize, sizeof(typename PTX_GEMM<M, K, N, 1>::Smem)>>>(dA, dB, dC);
+            break;
+        case -2:
+            ptx_gemm_confilct_ldmatrix<M, K, N><<<dim3(PTX_GEMM<M, K, N, 2>::nBlocks, PTX_GEMM<M, K, N, 2>::mBlocks), (PTX_GEMM<M, K, N, 2>::mBlockWarps * PTX_GEMM<M, K, N, 2>::nBlockWarps) * PTX_GEMM<M, K, N, 2>::WarpSize, sizeof(typename PTX_GEMM<M, K, N, 2>::Smem)>>>(dA, dB, dC);
+            break;
+        case -3:
+            ptx_gemm_no_padding<M, K, N><<<dim3(PTX_GEMM<M, K, N, 3>::nBlocks, PTX_GEMM<M, K, N, 3>::mBlocks), (PTX_GEMM<M, K, N, 3>::mBlockWarps * PTX_GEMM<M, K, N, 3>::nBlockWarps) * PTX_GEMM<M, K, N, 3>::WarpSize, sizeof(typename PTX_GEMM<M, K, N, 3>::Smem)>>>(dA, dB, dC);
             break;
         case 1:
-            cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &alpha, dA, CUDA_R_16F, N, dB, CUDA_R_16F, K, &beta, dC, CUDA_R_32F, N, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &alpha, dB, CUDA_R_16F, K, dA, CUDA_R_16F, N, &beta, dC, CUDA_R_32F, N, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
             break;
         case 2:
-	        cutlass::Kernel<CutlassGemm::GemmKernel><<<grid, block, smem_size>>>(cutlass_gemm.params_);
+            cutlass::Kernel<CutlassGemm::GemmKernel><<<grid, block, smem_size>>>(cutlass_gemm.params_);
             break;
         }
     }
     void print(double sec, int method = 0) const
     {
-        static const char *name[] = {"myptxgemm", "cublas", "cutlass"};
+        static const char *_name[] = {"myptxgemm_no_padding", "myptxgemm_conflict_ldmatrix", "myptxgemm_conflict_ldgsts", "myptxgemm_max_perf", "cublas", "cutlass"};
+        static const char **name = _name + 3;
         double tflops = 2.0 * M * N * K / (1024.0 * 1024.0 * 1024.0 * 1024.0) / sec;
         printf("kern=%s, M=%lu, K=%lu, N=%lu, perf=%gTflops\n", name[method], M, K, N, tflops);
     }

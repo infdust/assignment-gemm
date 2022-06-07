@@ -1,1 +1,6 @@
 *.out
+*.qdrep
+*.sqlite
+*.ncu-rep
+target/*
+sections/*

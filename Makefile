@@ -2,6 +2,11 @@ default:
 	-rm -rf a.out
 	nvcc -O2 -arch=sm_80 -lcublas -I ../../cutlass/cutlass/include main.cu
 	./a.out
+prof:
+	-rm -rf a.out
+	nvcc -O2 -arch=sm_80 -lcublas -I ../../cutlass/cutlass/include main.cu -lineinfo
+	-rm -rf profile.ncu-rep
+	sudo /usr/local/cuda/bin/ncu -o profile --kernel-id :::"100" --set full ./a.out
 unit_test:
 	-rm -rf a.out
 	nvcc -O2 -arch=sm_80 -lcublas -I ../../cutlass/cutlass/include test.cu -lgtest -lpthread

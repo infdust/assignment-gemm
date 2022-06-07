@@ -2,27 +2,32 @@
 #include "gemm.h"
 bool f_eq(float a, float b)
 {
-    return (a - b) / (a + b + 1.0f) < 0.001f;
+    if (((a - b) / (a + b + 0.1f) < 0.1f) && (b - a) / (a + b + 0.1f) < 0.1f)
+        return true;
+    return a==b;
 }
-TEST(ptx_gemm, test_8192_8192_8192)
+TEST(ptx_gemm, test_256_256_256)
 {
-    MatMul<8192, 8192, 8192> matmul{};
+    MatMul<256, 256, 256> matmul{};
     half *a = matmul.getA();
-    for (int i = 0; i < 8192 * 8192; ++i)
-        a[i] = half(((i / 8192) % 128) + ((i / 8192) / 64));
+    for (int i = 0; i < 256 * 256; ++i)
+        a[i] = half(i/2);
     a = matmul.getB();
-    for (int i = 0; i < 8192 * 8192; ++i)
-        a[i] = half(((i / 8192) % 128) + ((i / 8192) / 64));
+    for (int i = 0; i < 256 * 256; ++i)
+        a[i] = half(((i % 256)) - ((i / 256)));
     matmul.set();
-    auto ans1 = new float[8192 * 8192];
-    matmul.run(-1);
-    memcpy(ans1, matmul.get(), 8192 * 8192 * sizeof(float));
+    auto ans1 = new float[256 * 256];
+    matmul.run(0);
+    memcpy(ans1, matmul.get(), 256 * 256 * sizeof(float));
     matmul.run(1);
     auto ans2 = matmul.get();
     int diff = 0;
-    for (int i = 0; i < 8192 * 8192; ++i)
+    for (int i = 0; i < 256 * 256; ++i)
         if (!f_eq(ans1[i], ans2[i]))
+        {
             ++diff;
+            printf("%u, %u, %g, %g\n", i / 256, i % 256, ans1[i], ans2[i]);
+        }
     EXPECT_EQ(diff, 0);
     delete[] ans1;
 };
