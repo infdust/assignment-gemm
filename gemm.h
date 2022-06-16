@@ -6,6 +6,7 @@
 #define private public
 #include <cutlass/gemm/device/gemm.h>
 #undef private
+//#include "ptx_gemm.h"
 #include "ptx_gemm.h"
 using namespace nvcuda::wmma;
 template <size_t M, size_t K, size_t N>
@@ -111,31 +112,15 @@ public:
         smem_size = size_t(sizeof(typename CutlassGemm::GemmKernel::SharedStorage));
         if (smem_size >= (0xC000))
             cudaFuncSetAttribute(cutlass::Kernel<CutlassGemm::GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-        if (sizeof(typename PTX_GEMM<M, K, N, 0>::Smem) >= (0xC000))
-            cudaFuncSetAttribute(ptx_gemm_max_perf<M, K, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(typename PTX_GEMM<M, K, N, 0>::Smem));
-        if (sizeof(typename PTX_GEMM<M, K, N, 1>::Smem) >= (0xC000))
-            cudaFuncSetAttribute(ptx_gemm_conflict_ldgsts<M, K, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(typename PTX_GEMM<M, K, N, 1>::Smem));
-        if (sizeof(typename PTX_GEMM<M, K, N, 2>::Smem) >= (0xC000))
-            cudaFuncSetAttribute(ptx_gemm_confilct_ldmatrix<M, K, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(typename PTX_GEMM<M, K, N, 2>::Smem));
-        if (sizeof(typename PTX_GEMM<M, K, N, 3>::Smem) >= (0xC000))
-            cudaFuncSetAttribute(ptx_gemm_no_padding<M, K, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(typename PTX_GEMM<M, K, N, 3>::Smem));
-        //cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
+        if (sizeof(typename PTX_GEMM<M, K, N>::Smem) >= (0xC000))
+            cudaFuncSetAttribute(ptx_gemm<M, K, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(typename PTX_GEMM<M, K, N>::Smem));
     }
     void run(int method = 0) const
     {
         switch (method)
         {
         case 0:
-            ptx_gemm_max_perf<M, K, N><<<dim3(PTX_GEMM<M, K, N, 0>::nBlocks, PTX_GEMM<M, K, N, 0>::mBlocks), (PTX_GEMM<M, K, N, 0>::mBlockWarps * PTX_GEMM<M, K, N, 0>::nBlockWarps) * PTX_GEMM<M, K, N, 0>::WarpSize, sizeof(typename PTX_GEMM<M, K, N, 0>::Smem)>>>(dA, dB, dC);
-            break;
-        case -1:
-            ptx_gemm_conflict_ldgsts<M, K, N><<<dim3(PTX_GEMM<M, K, N, 1>::nBlocks, PTX_GEMM<M, K, N, 1>::mBlocks), (PTX_GEMM<M, K, N, 1>::mBlockWarps * PTX_GEMM<M, K, N, 1>::nBlockWarps) * PTX_GEMM<M, K, N, 1>::WarpSize, sizeof(typename PTX_GEMM<M, K, N, 1>::Smem)>>>(dA, dB, dC);
-            break;
-        case -2:
-            ptx_gemm_confilct_ldmatrix<M, K, N><<<dim3(PTX_GEMM<M, K, N, 2>::nBlocks, PTX_GEMM<M, K, N, 2>::mBlocks), (PTX_GEMM<M, K, N, 2>::mBlockWarps * PTX_GEMM<M, K, N, 2>::nBlockWarps) * PTX_GEMM<M, K, N, 2>::WarpSize, sizeof(typename PTX_GEMM<M, K, N, 2>::Smem)>>>(dA, dB, dC);
-            break;
-        case -3:
-            ptx_gemm_no_padding<M, K, N><<<dim3(PTX_GEMM<M, K, N, 3>::nBlocks, PTX_GEMM<M, K, N, 3>::mBlocks), (PTX_GEMM<M, K, N, 3>::mBlockWarps * PTX_GEMM<M, K, N, 3>::nBlockWarps) * PTX_GEMM<M, K, N, 3>::WarpSize, sizeof(typename PTX_GEMM<M, K, N, 3>::Smem)>>>(dA, dB, dC);
+            ptx_gemm<M, K, N><<<dim3(PTX_GEMM<M, K, N>::nBlocks, PTX_GEMM<M, K, N>::mBlocks), (PTX_GEMM<M, K, N>::mBlockWarps * PTX_GEMM<M, K, N>::nBlockWarps) * PTX_GEMM<M, K, N>::WarpSize, sizeof(typename PTX_GEMM<M, K, N>::Smem)>>>(dA, dB, dC);
             break;
         case 1:
             cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &alpha, dB, CUDA_R_16F, K, dA, CUDA_R_16F, N, &beta, dC, CUDA_R_32F, N, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -147,10 +132,10 @@ public:
     }
     void print(double sec, int method = 0) const
     {
-        static const char *_name[] = {"myptxgemm_no_padding", "myptxgemm_conflict_ldmatrix", "myptxgemm_conflict_ldgsts", "myptxgemm_max_perf", "cublas", "cutlass"};
-        static const char **name = _name + 3;
+        static const char *_name[] = {"mygemm", "cublas", "cutlass"};
+        static const char **name = _name + 0;
         double tflops = 2.0 * M * N * K / (1024.0 * 1024.0 * 1024.0 * 1024.0) / sec;
-        printf("kern=%s, M=%lu, K=%lu, N=%lu, perf=%gTflops\n", name[method], M, K, N, tflops);
+        printf("kern = %s, M = %lu, K = %lu, N = %lu, perf = %g Tflops\n", name[method], M, K, N, tflops);
     }
     ~MatMul()
     {
