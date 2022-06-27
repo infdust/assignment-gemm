@@ -3,7 +3,6 @@
 #include <type_traits>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#define QWE 3
 
 #ifdef COMPILING
 template <size_t M, size_t K, size_t N>
@@ -47,6 +46,15 @@ static constexpr size_t N = 8192;
     static constexpr size_t CopyRate = sizeof(copy_t) / sizeof(half);
     static constexpr size_t WarpSize = 32;
     static constexpr size_t BlockThreads = mBlockWarps * kBlockWarps * nBlockWarps * WarpSize;
+
+    __device__ static void cp_async(void *dst, const void *src)
+    {
+        asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
+                     :
+                     : "r"((__uint32_t)__cvta_generic_to_shared(dst)), "l"(src));
+    }
+    __device__ static size_t getY() { return (blockIdx.y * 4 % 64) + blockIdx.x / 8; }
+    __device__ static size_t getX() { return (blockIdx.x % 8) + 8 * (blockIdx.y / 16); }
     template <typename T, size_t _m, size_t _n, size_t _ld>
     struct Matrix
     {
@@ -91,19 +99,21 @@ static constexpr size_t N = 8192;
     {
         using Base = Matrix<copy_t, mBlockWidth, kBlockWidth * sizeof(half) / sizeof(copy_t), ldA>;
         using Base::operator[];
-        using Piece = Matrix<copy_t, BlockThreads * kBlockWarps * sizeof(copy_t) / (kBlockWidth * sizeof(half)), kWarpWidth * sizeof(half) / sizeof(copy_t), ldA>;
+        using Piece = Matrix<copy_t, BlockThreads * sizeof(copy_t) / (kBlockWidth * sizeof(half)), kBlockWidth * sizeof(half) / sizeof(copy_t), ldA>;
         static constexpr size_t mRange = Base::m / Piece::m;
         static constexpr size_t nRange = Base::n / Piece::n;
-        __device__ const copy_t *get(size_t im, size_t in) const { return &(Base::template slice<Piece>(im, in)[0][0]); }
+        template <size_t im>
+        __device__ const copy_t *get() const { return &(Base::template slice<Piece>(im, 0)[0][0]); }
     };
     struct KBlockCopyMatrixB_Global : public Matrix<copy_t, kBlockWidth, nBlockWidth * sizeof(half) / sizeof(copy_t), ldB>
     {
         using Base = Matrix<copy_t, kBlockWidth, nBlockWidth * sizeof(half) / sizeof(copy_t), ldB>;
         using Base::operator[];
-        using Piece = Matrix<copy_t, BlockThreads * nBlockWarps * sizeof(copy_t) / (nBlockWidth * sizeof(half)), kWarpWidth * sizeof(half) / sizeof(copy_t), ldA>;
+        using Piece = Matrix<copy_t, BlockThreads * sizeof(copy_t) / (nBlockWidth * sizeof(half)), nBlockWidth * sizeof(half) / sizeof(copy_t), ldA>;
         static constexpr size_t mRange = Base::m / Piece::m;
         static constexpr size_t nRange = Base::n / Piece::n;
-        __device__ const copy_t *get(size_t im, size_t in) const { return &(Base::template slice<Piece>(im, in)[0][0]); }
+        template <size_t im>
+        __device__ const copy_t *get() const { return &(Base::template slice<Piece>(im, 0)[0][0]); }
     };
     struct BlockCopyMatrixA_Global : CombineMatrix<KBlockCopyMatrixA_Global, 1, kBlocks>
     {
@@ -131,8 +141,8 @@ static constexpr size_t N = 8192;
         __device__ const BlockCopyMatrixA_Global &getCopyBlock() const
         {
             return Base::template convert()
-                .template slice<BlockCopyMatrixA_Global>(blockIdx.y, 0)
-                .move(threadIdx.x / 8, threadIdx.x % 8)
+                .template slice<BlockCopyMatrixA_Global>(getY(), 0)
+                .move(threadIdx.x / (kBlockWidth * sizeof(half) / sizeof(copy_t)), threadIdx.x % (kBlockWidth * sizeof(half) / sizeof(copy_t)))
                 .template convert<BlockCopyMatrixA_Global>();
         }
     };
@@ -143,8 +153,8 @@ static constexpr size_t N = 8192;
         __device__ const BlockCopyMatrixB_Global &getCopyBlock() const
         {
             return Base::template convert()
-                .template slice<BlockCopyMatrixB_Global>(0, blockIdx.x)
-                .move(threadIdx.x / 8, threadIdx.x % 8)
+                .template slice<BlockCopyMatrixB_Global>(0, getX())
+                .move(threadIdx.x / (nBlockWidth * sizeof(half) / sizeof(copy_t)), threadIdx.x % (nBlockWidth * sizeof(half) / sizeof(copy_t)))
                 .template convert<BlockCopyMatrixB_Global>();
         }
     };
@@ -154,7 +164,7 @@ static constexpr size_t N = 8192;
         using Base::operator[];
         __device__ WarpMatrixC_Global &getWarpBlock()
         {
-            return Base::template slice<Matrix<float, mBlockWidth, nBlockWidth, ldC>>(blockIdx.y, blockIdx.x)
+            return Base::template slice<Matrix<float, mBlockWidth, nBlockWidth, ldC>>(getY(), getX())
                 .template slice<Matrix<float, mWarpWidth, nWarpWidth, ldC>>((threadIdx.x / warpSize) / nBlockWarps, (threadIdx.x / warpSize) % nBlockWarps)
                 .template convert<WarpMatrixC_Global>()
                 .move((threadIdx.x % warpSize) / 16, (threadIdx.x % 16) * 4)
@@ -167,20 +177,22 @@ static constexpr size_t N = 8192;
     {
         using Base = Matrix<copy_t, mBlockWidth, kBlockWidth * sizeof(half) / sizeof(copy_t), sldA>;
         using Base::operator[];
-        using Piece = Matrix<copy_t, BlockThreads * kBlockWarps * sizeof(copy_t) / (kBlockWidth * sizeof(half)), kWarpWidth * sizeof(half) / sizeof(copy_t), sldA>;
+        using Piece = Matrix<copy_t, BlockThreads * sizeof(copy_t) / (kBlockWidth * sizeof(half)), kBlockWidth * sizeof(half) / sizeof(copy_t), sldA>;
         static constexpr size_t mRange = Base::m / Piece::m;
         static constexpr size_t nRange = Base::n / Piece::n;
-        __device__ copy_t *get(size_t im, size_t in) { return &(Base::template slice<Piece>(im, in)[0][0]); }
+        template <size_t im>
+        __device__ copy_t *get() { return &(Base::template slice<Piece>(im, 0)[0][0]); }
     };
     struct SmemCopyMatrixB
         : public Matrix<copy_t, kBlockWidth, nBlockWidth * sizeof(half) / sizeof(copy_t), sldB>
     {
         using Base = Matrix<copy_t, kBlockWidth, nBlockWidth * sizeof(half) / sizeof(copy_t), sldB>;
         using Base::operator[];
-        using Piece = Matrix<copy_t, BlockThreads * nBlockWarps * sizeof(copy_t) / (nBlockWidth * sizeof(half)), nWarpWidth * sizeof(half) / sizeof(copy_t), sldB>;
+        using Piece = Matrix<copy_t, BlockThreads * sizeof(copy_t) / (nBlockWidth * sizeof(half)), nBlockWidth * sizeof(half) / sizeof(copy_t), sldB>;
         static constexpr size_t mRange = Base::m / Piece::m;
         static constexpr size_t nRange = Base::n / Piece::n;
-        __device__ copy_t *get(size_t im, size_t in) { return &(Base::template slice<Piece>(im, in)[0][0]); }
+        template <size_t im>
+        __device__ copy_t *get() { return &(Base::template slice<Piece>(im, 0)[0][0]); }
     };
 
     struct CoreMatrixA : public Matrix<copy_t, mCoreWidth, kCoreWidth * sizeof(half) / sizeof(copy_t), sldA>
@@ -229,7 +241,7 @@ static constexpr size_t N = 8192;
         __device__ SmemCopyMatrixA &getCopyBlock()
         {
             return Base::template convert<SmemCopyMatrixA>()
-                .move(threadIdx.x / 8, (threadIdx.x % 8) ^ ((threadIdx.x / 8) % 8))
+                .move(threadIdx.x / (kBlockWidth * sizeof(half) / sizeof(copy_t)), (threadIdx.x % (kBlockWidth * sizeof(half) / sizeof(copy_t))) ^ ((threadIdx.x / (kBlockWidth * sizeof(half) / sizeof(copy_t))) % 8))
                 .template convert<SmemCopyMatrixA>();
         }
         __device__ WarpMatrixA &getWarpBlock()
@@ -244,7 +256,7 @@ static constexpr size_t N = 8192;
         __device__ SmemCopyMatrixB &getCopyBlock()
         {
             return Base::template convert<SmemCopyMatrixB>()
-                .move(threadIdx.x / 8, (threadIdx.x % 8) ^ ((threadIdx.x / 8) % 8))
+                .move(threadIdx.x / (nBlockWidth * sizeof(half) / sizeof(copy_t)), (threadIdx.x % (nBlockWidth * sizeof(half) / sizeof(copy_t))) ^ ((threadIdx.x / (nBlockWidth * sizeof(half) / sizeof(copy_t))) % 8))
                 .template convert<SmemCopyMatrixB>();
         }
         __device__ WarpMatrixB &getWarpBlock()
@@ -302,20 +314,18 @@ static constexpr size_t N = 8192;
             SmemCopyMatrixB &smemB = __selectBuffer(smemB3, k);
             const KBlockCopyMatrixA_Global &kBlockA = blockA.getKBlock(k);
             const KBlockCopyMatrixB_Global &kBlockB = blockB.getKBlock(k);
-#pragma unroll
-            for (size_t m = 0; m < KBlockCopyMatrixA_Global::mRange; ++m)
-#pragma unroll
-                for (size_t n = 0; n < KBlockCopyMatrixA_Global::nRange; ++n)
-                    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                                 :
-                                 : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(m, n))), "l"(kBlockA.get(m, n)));
-#pragma unroll
-            for (size_t m = 0; m < KBlockCopyMatrixB_Global::mRange; ++m)
-#pragma unroll
-                for (size_t n = 0; n < KBlockCopyMatrixB_Global::nRange; ++n)
-                    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                                 :
-                                 : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(m, n))), "l"(kBlockB.get(m, n)));
+            cp_async(smemA.template get<0>(), kBlockA.template get<0>());
+            cp_async(smemA.template get<1>(), kBlockA.template get<1>());
+            cp_async(smemA.template get<2>(), kBlockA.template get<2>());
+            cp_async(smemA.template get<3>(), kBlockA.template get<3>());
+            cp_async(smemB.template get<0>(), kBlockB.template get<0>());
+            cp_async(smemB.template get<1>(), kBlockB.template get<1>());
+            cp_async(smemB.template get<2>(), kBlockB.template get<2>());
+            cp_async(smemB.template get<3>(), kBlockB.template get<3>());
+            cp_async(smemB.template get<4>(), kBlockB.template get<4>());
+            cp_async(smemB.template get<5>(), kBlockB.template get<5>());
+            cp_async(smemB.template get<6>(), kBlockB.template get<6>());
+            cp_async(smemB.template get<7>(), kBlockB.template get<7>());
             asm volatile("cp.async.commit_group;\n");
         }
         {
@@ -337,41 +347,196 @@ static constexpr size_t N = 8192;
                              : "=r"(B[0][i * 2][0]), "=r"(B[0][i * 2][1]), "=r"(B[0][i * 2 + 1][0]), "=r"(B[0][i * 2 + 1][1])
                              : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(0, i))));
             }
+            {
+                size_t kCoreIndex = 1;
 #pragma unroll
-            for (size_t kCoreIndex = 1; kCoreIndex < kWarpCores; ++kCoreIndex)
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[0][j][0]), "=r"(C[0][j][1]), "=r"(C[0][j][2]), "=r"(C[0][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][0][0]), "r"(A[(kCoreIndex + 1) % 2][0][1]), "r"(A[(kCoreIndex + 1) % 2][0][2]), "r"(A[(kCoreIndex + 1) % 2][0][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[0][j][0]), "r"(C[0][j][1]), "r"(C[0][j][2]), "r"(C[0][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][0][0]), "=r"(A[kCoreIndex % 2][0][1]), "=r"(A[kCoreIndex % 2][0][2]), "=r"(A[kCoreIndex % 2][0][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(0, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][0][0]), "=r"(B[kCoreIndex % 2][0][1]), "=r"(B[kCoreIndex % 2][1][0]), "=r"(B[kCoreIndex % 2][1][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 0))));
 #pragma unroll
-                for (size_t i = 0; i < 4; ++i)
-                {
-                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                                 : "=r"(A[kCoreIndex % 2][i][0]), "=r"(A[kCoreIndex % 2][i][1]), "=r"(A[kCoreIndex % 2][i][2]), "=r"(A[kCoreIndex % 2][i][3])
-                                 : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(i, kCoreIndex))));
-                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                                 : "=r"(B[kCoreIndex % 2][i * 2][0]), "=r"(B[kCoreIndex % 2][i * 2][1]), "=r"(B[kCoreIndex % 2][i * 2 + 1][0]), "=r"(B[kCoreIndex % 2][i * 2 + 1][1])
-                                 : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, i))));
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[1][j][0]), "=r"(C[1][j][1]), "=r"(C[1][j][2]), "=r"(C[1][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][1][0]), "r"(A[(kCoreIndex + 1) % 2][1][1]), "r"(A[(kCoreIndex + 1) % 2][1][2]), "r"(A[(kCoreIndex + 1) % 2][1][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[1][j][0]), "r"(C[1][j][1]), "r"(C[1][j][2]), "r"(C[1][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][1][0]), "=r"(A[kCoreIndex % 2][1][1]), "=r"(A[kCoreIndex % 2][1][2]), "=r"(A[kCoreIndex % 2][1][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(1, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][2][0]), "=r"(B[kCoreIndex % 2][2][1]), "=r"(B[kCoreIndex % 2][3][0]), "=r"(B[kCoreIndex % 2][3][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 1))));
 #pragma unroll
-                    for (size_t j = 0; j < nWarpCores; ++j)
-                        asm volatile(
-                            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
-                            : "=r"(C[i][j][0]), "=r"(C[i][j][1]), "=r"(C[i][j][2]), "=r"(C[i][j][3])
-                            : "r"(A[(kCoreIndex + 1) % 2][i][0]), "r"(A[(kCoreIndex + 1) % 2][i][1]), "r"(A[(kCoreIndex + 1) % 2][i][2]), "r"(A[(kCoreIndex + 1) % 2][i][3]),
-                              "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
-                              "r"(C[i][j][0]), "r"(C[i][j][1]), "r"(C[i][j][2]), "r"(C[i][j][3]));
-                }
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[2][j][0]), "=r"(C[2][j][1]), "=r"(C[2][j][2]), "=r"(C[2][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][2][0]), "r"(A[(kCoreIndex + 1) % 2][2][1]), "r"(A[(kCoreIndex + 1) % 2][2][2]), "r"(A[(kCoreIndex + 1) % 2][2][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[2][j][0]), "r"(C[2][j][1]), "r"(C[2][j][2]), "r"(C[2][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][2][0]), "=r"(A[kCoreIndex % 2][2][1]), "=r"(A[kCoreIndex % 2][2][2]), "=r"(A[kCoreIndex % 2][2][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(2, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
+                cp_async(smemA.template get<0>(), kBlockA.template get<0>());
+                cp_async(smemA.template get<1>(), kBlockA.template get<1>());
+                cp_async(smemA.template get<2>(), kBlockA.template get<2>());
+                cp_async(smemA.template get<3>(), kBlockA.template get<3>());
 #pragma unroll
-            for (size_t m = 0; m < KBlockCopyMatrixA_Global::mRange; ++m)
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[3][j][0]), "=r"(C[3][j][1]), "=r"(C[3][j][2]), "=r"(C[3][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][3][0]), "r"(A[(kCoreIndex + 1) % 2][3][1]), "r"(A[(kCoreIndex + 1) % 2][3][2]), "r"(A[(kCoreIndex + 1) % 2][3][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[3][j][0]), "r"(C[3][j][1]), "r"(C[3][j][2]), "r"(C[3][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][3][0]), "=r"(A[kCoreIndex % 2][3][1]), "=r"(A[kCoreIndex % 2][3][2]), "=r"(A[kCoreIndex % 2][3][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(3, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][6][0]), "=r"(B[kCoreIndex % 2][6][1]), "=r"(B[kCoreIndex % 2][7][0]), "=r"(B[kCoreIndex % 2][7][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 3))));
+            }
+            {
+                size_t kCoreIndex = 2;
 #pragma unroll
-                for (size_t n = 0; n < KBlockCopyMatrixA_Global::nRange; ++n)
-                    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                                 :
-                                 : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(m, n))), "l"(kBlockA.get(m, n)));
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[0][j][0]), "=r"(C[0][j][1]), "=r"(C[0][j][2]), "=r"(C[0][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][0][0]), "r"(A[(kCoreIndex + 1) % 2][0][1]), "r"(A[(kCoreIndex + 1) % 2][0][2]), "r"(A[(kCoreIndex + 1) % 2][0][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[0][j][0]), "r"(C[0][j][1]), "r"(C[0][j][2]), "r"(C[0][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][0][0]), "=r"(A[kCoreIndex % 2][0][1]), "=r"(A[kCoreIndex % 2][0][2]), "=r"(A[kCoreIndex % 2][0][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(0, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][0][0]), "=r"(B[kCoreIndex % 2][0][1]), "=r"(B[kCoreIndex % 2][1][0]), "=r"(B[kCoreIndex % 2][1][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 0))));
 #pragma unroll
-            for (size_t m = 0; m < KBlockCopyMatrixB_Global::mRange; ++m)
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[1][j][0]), "=r"(C[1][j][1]), "=r"(C[1][j][2]), "=r"(C[1][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][1][0]), "r"(A[(kCoreIndex + 1) % 2][1][1]), "r"(A[(kCoreIndex + 1) % 2][1][2]), "r"(A[(kCoreIndex + 1) % 2][1][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[1][j][0]), "r"(C[1][j][1]), "r"(C[1][j][2]), "r"(C[1][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][1][0]), "=r"(A[kCoreIndex % 2][1][1]), "=r"(A[kCoreIndex % 2][1][2]), "=r"(A[kCoreIndex % 2][1][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(1, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][2][0]), "=r"(B[kCoreIndex % 2][2][1]), "=r"(B[kCoreIndex % 2][3][0]), "=r"(B[kCoreIndex % 2][3][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 1))));
 #pragma unroll
-                for (size_t n = 0; n < KBlockCopyMatrixB_Global::nRange; ++n)
-                    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                                 :
-                                 : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(m, n))), "l"(kBlockB.get(m, n)));
-            asm volatile("cp.async.commit_group;\n");
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[2][j][0]), "=r"(C[2][j][1]), "=r"(C[2][j][2]), "=r"(C[2][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][2][0]), "r"(A[(kCoreIndex + 1) % 2][2][1]), "r"(A[(kCoreIndex + 1) % 2][2][2]), "r"(A[(kCoreIndex + 1) % 2][2][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[2][j][0]), "r"(C[2][j][1]), "r"(C[2][j][2]), "r"(C[2][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][2][0]), "=r"(A[kCoreIndex % 2][2][1]), "=r"(A[kCoreIndex % 2][2][2]), "=r"(A[kCoreIndex % 2][2][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(2, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
+                cp_async(smemB.template get<0>(), kBlockB.template get<0>());
+                cp_async(smemB.template get<1>(), kBlockB.template get<1>());
+                cp_async(smemB.template get<2>(), kBlockB.template get<2>());
+                cp_async(smemB.template get<3>(), kBlockB.template get<3>());
+#pragma unroll
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[3][j][0]), "=r"(C[3][j][1]), "=r"(C[3][j][2]), "=r"(C[3][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][3][0]), "r"(A[(kCoreIndex + 1) % 2][3][1]), "r"(A[(kCoreIndex + 1) % 2][3][2]), "r"(A[(kCoreIndex + 1) % 2][3][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[3][j][0]), "r"(C[3][j][1]), "r"(C[3][j][2]), "r"(C[3][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][3][0]), "=r"(A[kCoreIndex % 2][3][1]), "=r"(A[kCoreIndex % 2][3][2]), "=r"(A[kCoreIndex % 2][3][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(3, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][6][0]), "=r"(B[kCoreIndex % 2][6][1]), "=r"(B[kCoreIndex % 2][7][0]), "=r"(B[kCoreIndex % 2][7][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 3))));
+            }
+            {
+                size_t kCoreIndex = 3;
+#pragma unroll
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[0][j][0]), "=r"(C[0][j][1]), "=r"(C[0][j][2]), "=r"(C[0][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][0][0]), "r"(A[(kCoreIndex + 1) % 2][0][1]), "r"(A[(kCoreIndex + 1) % 2][0][2]), "r"(A[(kCoreIndex + 1) % 2][0][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[0][j][0]), "r"(C[0][j][1]), "r"(C[0][j][2]), "r"(C[0][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][0][0]), "=r"(A[kCoreIndex % 2][0][1]), "=r"(A[kCoreIndex % 2][0][2]), "=r"(A[kCoreIndex % 2][0][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(0, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][0][0]), "=r"(B[kCoreIndex % 2][0][1]), "=r"(B[kCoreIndex % 2][1][0]), "=r"(B[kCoreIndex % 2][1][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 0))));
+#pragma unroll
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[1][j][0]), "=r"(C[1][j][1]), "=r"(C[1][j][2]), "=r"(C[1][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][1][0]), "r"(A[(kCoreIndex + 1) % 2][1][1]), "r"(A[(kCoreIndex + 1) % 2][1][2]), "r"(A[(kCoreIndex + 1) % 2][1][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[1][j][0]), "r"(C[1][j][1]), "r"(C[1][j][2]), "r"(C[1][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][1][0]), "=r"(A[kCoreIndex % 2][1][1]), "=r"(A[kCoreIndex % 2][1][2]), "=r"(A[kCoreIndex % 2][1][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(1, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][2][0]), "=r"(B[kCoreIndex % 2][2][1]), "=r"(B[kCoreIndex % 2][3][0]), "=r"(B[kCoreIndex % 2][3][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 1))));
+#pragma unroll
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[2][j][0]), "=r"(C[2][j][1]), "=r"(C[2][j][2]), "=r"(C[2][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][2][0]), "r"(A[(kCoreIndex + 1) % 2][2][1]), "r"(A[(kCoreIndex + 1) % 2][2][2]), "r"(A[(kCoreIndex + 1) % 2][2][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[2][j][0]), "r"(C[2][j][1]), "r"(C[2][j][2]), "r"(C[2][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][2][0]), "=r"(A[kCoreIndex % 2][2][1]), "=r"(A[kCoreIndex % 2][2][2]), "=r"(A[kCoreIndex % 2][2][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(2, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
+                cp_async(smemB.template get<4>(), kBlockB.template get<4>());
+                cp_async(smemB.template get<5>(), kBlockB.template get<5>());
+                cp_async(smemB.template get<6>(), kBlockB.template get<6>());
+                cp_async(smemB.template get<7>(), kBlockB.template get<7>());
+                asm volatile("cp.async.commit_group;\n");
+#pragma unroll
+                for (size_t j = 0; j < nWarpCores; ++j)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+                        : "=r"(C[3][j][0]), "=r"(C[3][j][1]), "=r"(C[3][j][2]), "=r"(C[3][j][3])
+                        : "r"(A[(kCoreIndex + 1) % 2][3][0]), "r"(A[(kCoreIndex + 1) % 2][3][1]), "r"(A[(kCoreIndex + 1) % 2][3][2]), "r"(A[(kCoreIndex + 1) % 2][3][3]),
+                          "r"(B[(kCoreIndex + 1) % 2][j][0]), "r"(B[(kCoreIndex + 1) % 2][j][1]),
+                          "r"(C[3][j][0]), "r"(C[3][j][1]), "r"(C[3][j][2]), "r"(C[3][j][3]));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(A[kCoreIndex % 2][3][0]), "=r"(A[kCoreIndex % 2][3][1]), "=r"(A[kCoreIndex % 2][3][2]), "=r"(A[kCoreIndex % 2][3][3])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpA.get(3, kCoreIndex))));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(B[kCoreIndex % 2][6][0]), "=r"(B[kCoreIndex % 2][6][1]), "=r"(B[kCoreIndex % 2][7][0]), "=r"(B[kCoreIndex % 2][7][1])
+                             : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 3))));
+            }
         }
         for (size_t k = 1; k < kBlocks - 4; k += 3)
         {
@@ -487,18 +652,10 @@ static constexpr size_t N = 8192;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                                  : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(0, 0))), "l"(kBlockA.get(0, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(1, 0))), "l"(kBlockA.get(1, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(2, 0))), "l"(kBlockA.get(2, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(3, 0))), "l"(kBlockA.get(3, 0)));
+                    cp_async(smemA.template get<0>(), kBlockA.template get<0>());
+                    cp_async(smemA.template get<1>(), kBlockA.template get<1>());
+                    cp_async(smemA.template get<2>(), kBlockA.template get<2>());
+                    cp_async(smemA.template get<3>(), kBlockA.template get<3>());
 #pragma unroll
                     for (size_t j = 0; j < nWarpCores; ++j)
                         asm volatile(
@@ -558,18 +715,10 @@ static constexpr size_t N = 8192;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                                  : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 0))), "l"(kBlockB.get(0, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 1))), "l"(kBlockB.get(0, 1)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 0))), "l"(kBlockB.get(1, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 1))), "l"(kBlockB.get(1, 1)));
+                    cp_async(smemB.template get<0>(), kBlockB.template get<0>());
+                    cp_async(smemB.template get<1>(), kBlockB.template get<1>());
+                    cp_async(smemB.template get<2>(), kBlockB.template get<2>());
+                    cp_async(smemB.template get<3>(), kBlockB.template get<3>());
 #pragma unroll
                     for (size_t j = 0; j < nWarpCores; ++j)
                         asm volatile(
@@ -629,18 +778,11 @@ static constexpr size_t N = 8192;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                                  : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 2))), "l"(kBlockB.get(0, 2)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 3))), "l"(kBlockB.get(0, 3)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 2))), "l"(kBlockB.get(1, 2)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 3))), "l"(kBlockB.get(1, 3)));
+                    cp_async(smemB.template get<4>(), kBlockB.template get<4>());
+                    cp_async(smemB.template get<5>(), kBlockB.template get<5>());
+                    cp_async(smemB.template get<6>(), kBlockB.template get<6>());
+                    cp_async(smemB.template get<7>(), kBlockB.template get<7>());
+                    asm volatile("cp.async.commit_group;\n");
 #pragma unroll
                     for (size_t j = 0; j < nWarpCores; ++j)
                         asm volatile(
@@ -656,7 +798,6 @@ static constexpr size_t N = 8192;
                                  : "=r"(B[kCoreIndex % 2][6][0]), "=r"(B[kCoreIndex % 2][6][1]), "=r"(B[kCoreIndex % 2][7][0]), "=r"(B[kCoreIndex % 2][7][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 3))));
                 }
-                asm volatile("cp.async.commit_group;\n");
             }
             {
                 asm volatile("cp.async.wait_group %0;\n" ::"n"(1));
@@ -770,18 +911,10 @@ static constexpr size_t N = 8192;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                                  : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(0, 0))), "l"(kBlockA.get(0, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(1, 0))), "l"(kBlockA.get(1, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(2, 0))), "l"(kBlockA.get(2, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(3, 0))), "l"(kBlockA.get(3, 0)));
+                    cp_async(smemA.template get<0>(), kBlockA.template get<0>());
+                    cp_async(smemA.template get<1>(), kBlockA.template get<1>());
+                    cp_async(smemA.template get<2>(), kBlockA.template get<2>());
+                    cp_async(smemA.template get<3>(), kBlockA.template get<3>());
 #pragma unroll
                     for (size_t j = 0; j < nWarpCores; ++j)
                         asm volatile(
@@ -841,18 +974,10 @@ static constexpr size_t N = 8192;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                                  : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 0))), "l"(kBlockB.get(0, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 1))), "l"(kBlockB.get(0, 1)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 0))), "l"(kBlockB.get(1, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 1))), "l"(kBlockB.get(1, 1)));
+                    cp_async(smemB.template get<0>(), kBlockB.template get<0>());
+                    cp_async(smemB.template get<1>(), kBlockB.template get<1>());
+                    cp_async(smemB.template get<2>(), kBlockB.template get<2>());
+                    cp_async(smemB.template get<3>(), kBlockB.template get<3>());
 #pragma unroll
                     for (size_t j = 0; j < nWarpCores; ++j)
                         asm volatile(
@@ -912,18 +1037,11 @@ static constexpr size_t N = 8192;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                                  : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 2))), "l"(kBlockB.get(0, 2)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 3))), "l"(kBlockB.get(0, 3)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 2))), "l"(kBlockB.get(1, 2)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 3))), "l"(kBlockB.get(1, 3)));
+                    cp_async(smemB.template get<4>(), kBlockB.template get<4>());
+                    cp_async(smemB.template get<5>(), kBlockB.template get<5>());
+                    cp_async(smemB.template get<6>(), kBlockB.template get<6>());
+                    cp_async(smemB.template get<7>(), kBlockB.template get<7>());
+                    asm volatile("cp.async.commit_group;\n");
 #pragma unroll
                     for (size_t j = 0; j < nWarpCores; ++j)
                         asm volatile(
@@ -939,7 +1057,6 @@ static constexpr size_t N = 8192;
                                  : "=r"(B[kCoreIndex % 2][6][0]), "=r"(B[kCoreIndex % 2][6][1]), "=r"(B[kCoreIndex % 2][7][0]), "=r"(B[kCoreIndex % 2][7][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 3))));
                 }
-                asm volatile("cp.async.commit_group;\n");
             }
             {
                 asm volatile("cp.async.wait_group %0;\n" ::"n"(1));
@@ -1053,18 +1170,10 @@ static constexpr size_t N = 8192;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                                  : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(0, 0))), "l"(kBlockA.get(0, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(1, 0))), "l"(kBlockA.get(1, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(2, 0))), "l"(kBlockA.get(2, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(3, 0))), "l"(kBlockA.get(3, 0)));
+                    cp_async(smemA.template get<0>(), kBlockA.template get<0>());
+                    cp_async(smemA.template get<1>(), kBlockA.template get<1>());
+                    cp_async(smemA.template get<2>(), kBlockA.template get<2>());
+                    cp_async(smemA.template get<3>(), kBlockA.template get<3>());
 #pragma unroll
                     for (size_t j = 0; j < nWarpCores; ++j)
                         asm volatile(
@@ -1124,18 +1233,10 @@ static constexpr size_t N = 8192;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                                  : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 0))), "l"(kBlockB.get(0, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 1))), "l"(kBlockB.get(0, 1)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 0))), "l"(kBlockB.get(1, 0)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 1))), "l"(kBlockB.get(1, 1)));
+                    cp_async(smemB.template get<0>(), kBlockB.template get<0>());
+                    cp_async(smemB.template get<1>(), kBlockB.template get<1>());
+                    cp_async(smemB.template get<2>(), kBlockB.template get<2>());
+                    cp_async(smemB.template get<3>(), kBlockB.template get<3>());
 #pragma unroll
                     for (size_t j = 0; j < nWarpCores; ++j)
                         asm volatile(
@@ -1195,18 +1296,11 @@ static constexpr size_t N = 8192;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                                  : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 2))), "l"(kBlockB.get(0, 2)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 3))), "l"(kBlockB.get(0, 3)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 2))), "l"(kBlockB.get(1, 2)));
-                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                             :
-                             : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 3))), "l"(kBlockB.get(1, 3)));
+                    cp_async(smemB.template get<4>(), kBlockB.template get<4>());
+                    cp_async(smemB.template get<5>(), kBlockB.template get<5>());
+                    cp_async(smemB.template get<6>(), kBlockB.template get<6>());
+                    cp_async(smemB.template get<7>(), kBlockB.template get<7>());
+                    asm volatile("cp.async.commit_group;\n");
 #pragma unroll
                     for (size_t j = 0; j < nWarpCores; ++j)
                         asm volatile(
@@ -1222,7 +1316,6 @@ static constexpr size_t N = 8192;
                                  : "=r"(B[kCoreIndex % 2][6][0]), "=r"(B[kCoreIndex % 2][6][1]), "=r"(B[kCoreIndex % 2][7][0]), "=r"(B[kCoreIndex % 2][7][1])
                                  : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 3))));
                 }
-                asm volatile("cp.async.commit_group;\n");
             }
         }
 #pragma unroll
@@ -1339,12 +1432,10 @@ static constexpr size_t N = 8192;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                              : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                              : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(0, 0))), "l"(kBlockA.get(0, 0)));
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(1, 0))), "l"(kBlockA.get(1, 0)));
+                cp_async(smemA.template get<0>(), kBlockA.template get<0>());
+                cp_async(smemA.template get<1>(), kBlockA.template get<1>());
+                cp_async(smemA.template get<2>(), kBlockA.template get<2>());
+                cp_async(smemA.template get<3>(), kBlockA.template get<3>());
 #pragma unroll
                 for (size_t j = 0; j < nWarpCores; ++j)
                     asm volatile(
@@ -1360,12 +1451,6 @@ static constexpr size_t N = 8192;
                              : "=r"(B[kCoreIndex % 2][6][0]), "=r"(B[kCoreIndex % 2][6][1]), "=r"(B[kCoreIndex % 2][7][0]), "=r"(B[kCoreIndex % 2][7][1])
                              : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 3))));
             }
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(2, 0))), "l"(kBlockA.get(2, 0)));
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemA.get(3, 0))), "l"(kBlockA.get(3, 0)));
             {
                 size_t kCoreIndex = 2;
 #pragma unroll
@@ -1410,12 +1495,10 @@ static constexpr size_t N = 8192;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                              : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                              : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 0))), "l"(kBlockB.get(0, 0)));
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 1))), "l"(kBlockB.get(0, 1)));
+                cp_async(smemB.template get<0>(), kBlockB.template get<0>());
+                cp_async(smemB.template get<1>(), kBlockB.template get<1>());
+                cp_async(smemB.template get<2>(), kBlockB.template get<2>());
+                cp_async(smemB.template get<3>(), kBlockB.template get<3>());
 #pragma unroll
                 for (size_t j = 0; j < nWarpCores; ++j)
                     asm volatile(
@@ -1431,12 +1514,6 @@ static constexpr size_t N = 8192;
                              : "=r"(B[kCoreIndex % 2][6][0]), "=r"(B[kCoreIndex % 2][6][1]), "=r"(B[kCoreIndex % 2][7][0]), "=r"(B[kCoreIndex % 2][7][1])
                              : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 3))));
             }
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 0))), "l"(kBlockB.get(1, 0)));
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 1))), "l"(kBlockB.get(1, 1)));
             {
                 size_t kCoreIndex = 3;
 #pragma unroll
@@ -1481,12 +1558,11 @@ static constexpr size_t N = 8192;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                              : "=r"(B[kCoreIndex % 2][4][0]), "=r"(B[kCoreIndex % 2][4][1]), "=r"(B[kCoreIndex % 2][5][0]), "=r"(B[kCoreIndex % 2][5][1])
                              : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 2))));
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 2))), "l"(kBlockB.get(0, 2)));
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(0, 3))), "l"(kBlockB.get(0, 3)));
+                cp_async(smemB.template get<4>(), kBlockB.template get<4>());
+                cp_async(smemB.template get<5>(), kBlockB.template get<5>());
+                cp_async(smemB.template get<6>(), kBlockB.template get<6>());
+                cp_async(smemB.template get<7>(), kBlockB.template get<7>());
+                asm volatile("cp.async.commit_group;\n");
 #pragma unroll
                 for (size_t j = 0; j < nWarpCores; ++j)
                     asm volatile(
@@ -1502,13 +1578,6 @@ static constexpr size_t N = 8192;
                              : "=r"(B[kCoreIndex % 2][6][0]), "=r"(B[kCoreIndex % 2][6][1]), "=r"(B[kCoreIndex % 2][7][0]), "=r"(B[kCoreIndex % 2][7][1])
                              : "r"((__uint32_t)__cvta_generic_to_shared(warpB.get(kCoreIndex, 3))));
             }
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 2))), "l"(kBlockB.get(1, 2)));
-            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
-                         :
-                         : "r"((__uint32_t)__cvta_generic_to_shared(smemB.get(1, 3))), "l"(kBlockB.get(1, 3)));
-            asm volatile("cp.async.commit_group;\n");
         }
 #pragma unroll
         for (size_t k = kBlocks - 2; k < kBlocks; ++k)
