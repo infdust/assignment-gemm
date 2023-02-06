@@ -55,6 +55,10 @@ using gemmtest = PerfTest<MatMul<MN, K, MN>, GPUTimer>;
 #endif
 int main()
 {
+#ifdef MACRO_CUTLASS
     gemmtest<MACRO_MN, MACRO_K>().run<200, 1000>(0).run<200, 1000>(1).run<200, 1000>(2);
+#else 
+    gemmtest<MACRO_MN, MACRO_K>().run<200, 1000>(0).run<200, 1000>(1);
+#endif
     return 0;
 }

@@ -3,9 +3,11 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <cublas.h>
+#ifdef MACRO_CUTLASS
 #define private public
 #include <cutlass/gemm/device/gemm.h>
 #undef private
+#endif
 //#include "ptx_gemm.h"
 #include "ptx_gemm.h"
 using namespace nvcuda::wmma;
@@ -22,6 +24,7 @@ class MatMul
     void *buffer;
     float alpha;
     float beta;
+#ifdef MACRO_CUTLASS
     using ElementAccumulator = float;                  // <- data type of accumulator
     using ElementComputeEpilogue = ElementAccumulator; // <- data type of epilogue operations
     using ElementInputA = cutlass::half_t;             // <- data type of elements in input matrix A
@@ -76,6 +79,7 @@ class MatMul
     CutlassGemm::Arguments *args;
     dim3 grid;
     dim3 block;
+#endif
     size_t smem_size;
 
     static constexpr size_t ptxGemmMode = 0;
@@ -100,6 +104,7 @@ public:
         cudaMalloc(&dA, M * K * sizeof(half));
         cudaMalloc(&dB, K * N * sizeof(half));
         cudaMalloc(&dC, M * N * sizeof(float));
+#ifdef MACRO_CUTLASS
         args = new CutlassGemm::Arguments(cutlass::gemm::GemmCoord(M, N, K),
                                           cutlass::TensorRef<const cutlass::half_t, cutlass::layout::RowMajor>((cutlass::half_t *)dA, K),
                                           cutlass::TensorRef<const cutlass::half_t, cutlass::layout::RowMajor>((cutlass::half_t *)dB, N),
@@ -112,6 +117,7 @@ public:
         smem_size = size_t(sizeof(typename CutlassGemm::GemmKernel::SharedStorage));
         if (smem_size >= (0xC000))
             cudaFuncSetAttribute(cutlass::Kernel<CutlassGemm::GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+#endif
         if (sizeof(typename PTX_GEMM<M, K, N>::Smem) >= (0xC000))
             cudaFuncSetAttribute(ptx_gemm<M, K, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(typename PTX_GEMM<M, K, N>::Smem));
     }
@@ -125,9 +131,11 @@ public:
         case 1:
             cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &alpha, dB, CUDA_R_16F, K, dA, CUDA_R_16F, N, &beta, dC, CUDA_R_32F, N, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
             break;
+#ifdef MACRO_CUTLASS
         case 2:
             cutlass::Kernel<CutlassGemm::GemmKernel><<<grid, block, smem_size>>>(cutlass_gemm.params_);
             break;
+#endif
         }
     }
     void print(double sec, int method = 0) const
@@ -139,7 +147,9 @@ public:
     }
     ~MatMul()
     {
+#ifdef MACRO_CUTLASS
         delete args;
+#endif
         cudaFree(dA);
         cudaFree(dB);
         cudaFree(dC);
